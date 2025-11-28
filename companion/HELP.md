@@ -1,12 +1,12 @@
 # Riedel RSP-1232HL Companion Module
 
-This module allows you to control Riedel RSP-1232HL intercom panels from Bitfocus Companion.
+This module allows you to control Riedel Smart Panels from Bitfocus Companion.
 
 ## Requirements
 
 **Minimum Firmware Version**: 2.0.0 or higher
 
-This module requires the RSP-1232HL panel to be running firmware version 2.0.0 or later. Earlier firmware versions may not support the WebSocket API used by this module.
+This module requires the panel to be running firmware version 2.0.0 or later. Earlier firmware versions may not support the WebSocket API used by this module.
 
 ## Configuration
 
@@ -48,7 +48,7 @@ This module requires the RSP-1232HL panel to be running firmware version 2.0.0 o
 
 ## Network Interfaces
 
-The RSP-1232HL has three network interfaces:
+The panel has three network interfaces:
 
 - **Media1**: Main network interface (typically for control/media)
 - **Config1**: Configuration network interface
