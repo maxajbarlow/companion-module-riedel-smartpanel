@@ -72,4 +72,4 @@ The RSP-1232HL has three network interfaces:
 ## Support
 
 For issues or feature requests, please visit:
-https://github.com/yourusername/companion-module-riedel-rsp1232hl/issues
+https://github.com/maxajbarlow/companion-module-riedel-rsp1232hl/issues
