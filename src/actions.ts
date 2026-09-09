@@ -1,5 +1,7 @@
 import { Regex, CompanionActionDefinitions } from '@companion-module/base'
 import type { RiedelRSP1232HLInstance } from './main.js'
+import { parseKeySpec } from './keys.js'
+import { PANEL_CHOICES } from './config.js'
 
 export function getActions(instance: RiedelRSP1232HLInstance): CompanionActionDefinitions {
 	return {
@@ -578,6 +580,336 @@ export function getActions(instance: RiedelRSP1232HLInstance): CompanionActionDe
 				}
 				const durationMs = Number(action.options.durationMs ?? 250)
 				await instance.toggleKeyMuteAtIp(ip, panelId, keyNumber, durationMs)
+			},
+		},
+		setKeyMute: {
+			name: 'Set Key Mute (state-aware)',
+			description:
+				'Set a key muted or unmuted. Reads the real mute state from the panel and only actuates when it differs, so repeated presses are safe. Requires "Monitor mute state". Master panel.',
+			options: [
+				{
+					type: 'textinput',
+					label: 'Key Number (1 - 32)',
+					id: 'keyNumber',
+					default: '1',
+					useVariables: true,
+				},
+				{
+					type: 'dropdown',
+					label: 'Set to',
+					id: 'state',
+					default: 'on',
+					choices: [
+						{ id: 'on', label: 'Muted' },
+						{ id: 'off', label: 'Unmuted' },
+						{ id: 'toggle', label: 'Toggle (always actuate)' },
+					],
+				},
+				{
+					type: 'number',
+					label: 'Press Hold Duration (ms)',
+					id: 'durationMs',
+					default: 250,
+					min: 200,
+					max: 2000,
+				},
+			],
+			callback: async (action, context) => {
+				const parsed = await context.parseVariablesInString(String(action.options.keyNumber ?? '1'))
+				const keyNumber = parseInt(parsed, 10) || 1
+				const durationMs = Number(action.options.durationMs ?? 250)
+				const want = String(action.options.state ?? 'on')
+				if (want === 'toggle') {
+					await instance.toggleKeyMute(0, keyNumber, durationMs)
+					return
+				}
+				const desired = want === 'on'
+				const current = instance.getKeyMuted(keyNumber)
+				if (current === undefined) {
+					instance.log(
+						'warn',
+						`Set Key Mute: mute state for key ${keyNumber} is unknown - enable "Monitor mute state" and make sure the key is on the displayed shift page. Not actuating.`,
+					)
+					return
+				}
+				if (current === desired) {
+					instance.log('debug', `Set Key Mute: key ${keyNumber} already ${desired ? 'muted' : 'unmuted'}`)
+					return
+				}
+				await instance.toggleKeyMute(0, keyNumber, durationMs)
+			},
+		},
+		setKeyMuteMultiple: {
+			name: 'Set Mute on Multiple Keys (state-aware)',
+			description:
+				'Mute or unmute a set of keys in one action, e.g. "1-8" or "1,3,5-7". Only keys whose state differs are actuated, so this is safe to repeat - ideal for a focus-mute shortcut. Requires "Monitor mute state". Master panel.',
+			options: [
+				{
+					type: 'textinput',
+					label: 'Keys (e.g. 1-8 or 1,3,5-7)',
+					id: 'keys',
+					default: '1-8',
+					useVariables: true,
+				},
+				{
+					type: 'dropdown',
+					label: 'Set to',
+					id: 'state',
+					default: 'on',
+					choices: [
+						{ id: 'on', label: 'Muted' },
+						{ id: 'off', label: 'Unmuted' },
+					],
+				},
+				{
+					type: 'number',
+					label: 'Press Hold Duration (ms)',
+					id: 'durationMs',
+					default: 250,
+					min: 200,
+					max: 2000,
+				},
+			],
+			callback: async (action, context) => {
+				const spec = await context.parseVariablesInString(String(action.options.keys ?? ''))
+				const keys = parseKeySpec(spec)
+				if (keys.length === 0) {
+					instance.log('warn', `Set Mute on Multiple Keys: no valid keys in "${spec}"`)
+					return
+				}
+				const desired = String(action.options.state ?? 'on') === 'on'
+				const durationMs = Number(action.options.durationMs ?? 250)
+				// Work out the whole set first, then actuate it in a single batch so the
+				// keys change together instead of cascading one at a time.
+				const changed: number[] = []
+				const unknown: number[] = []
+				for (const key of keys) {
+					const current = instance.getKeyMuted(key)
+					if (current === undefined) {
+						unknown.push(key)
+						continue
+					}
+					if (current === desired) continue
+					changed.push(key)
+				}
+				if (changed.length > 0) {
+					await instance.toggleKeyMutes(0, changed, durationMs)
+				}
+				if (unknown.length > 0) {
+					instance.log(
+						'warn',
+						`Set Mute on Multiple Keys: state unknown for key(s) ${unknown.join(',')} - not actuated (enable "Monitor mute state").`,
+					)
+				}
+				instance.log(
+					'info',
+					`Set Mute on Multiple Keys: ${desired ? 'muted' : 'unmuted'} ${
+						changed.length > 0 ? changed.join(',') : 'nothing (already in the requested state)'
+					}`,
+				)
+			},
+		},
+		captureMuteState: {
+			name: 'Capture Mute State (snapshot)',
+			description:
+				'Record which keys are currently muted so you can put them back later with Restore Mute State. Leave Keys empty to capture every key whose state is known. Requires "Monitor mute state".',
+			options: [
+				{
+					type: 'textinput',
+					label: 'Snapshot name',
+					id: 'slot',
+					default: 'default',
+					useVariables: true,
+				},
+				{
+					type: 'textinput',
+					label: 'Keys to capture (empty = all, or e.g. 1-8)',
+					id: 'keys',
+					default: '',
+					useVariables: true,
+				},
+			],
+			callback: async (action, context) => {
+				const slot =
+					(await context.parseVariablesInString(String(action.options.slot ?? 'default'))).trim() || 'default'
+				const spec = await context.parseVariablesInString(String(action.options.keys ?? ''))
+				const keys = spec.trim() ? parseKeySpec(spec) : null
+				const { captured, unknown } = instance.captureMuteSnapshot(slot, keys)
+				if (captured.length === 0) {
+					instance.log(
+						'warn',
+						`Capture Mute State: nothing captured for "${slot}" - no key states are known yet. Enable "Monitor mute state" and check the keys are on the displayed shift page.`,
+					)
+					return
+				}
+				if (unknown.length > 0) {
+					instance.log(
+						'warn',
+						`Capture Mute State: state unknown for key(s) ${unknown.join(',')} - not included in snapshot "${slot}".`,
+					)
+				}
+				instance.log('info', `Capture Mute State: snapshot "${slot}" holds ${captured.length} key(s)`)
+			},
+		},
+		restoreMuteState: {
+			name: 'Restore Mute State (undo)',
+			description:
+				'Put every key in a snapshot back to the state it had when captured. Only keys that have since changed are actuated, so this is safe to press twice. Requires "Monitor mute state".',
+			options: [
+				{
+					type: 'textinput',
+					label: 'Snapshot name',
+					id: 'slot',
+					default: 'default',
+					useVariables: true,
+				},
+				{
+					type: 'number',
+					label: 'Press Hold Duration (ms)',
+					id: 'durationMs',
+					default: 250,
+					min: 200,
+					max: 2000,
+				},
+			],
+			callback: async (action, context) => {
+				const slot =
+					(await context.parseVariablesInString(String(action.options.slot ?? 'default'))).trim() || 'default'
+				const durationMs = Number(action.options.durationMs ?? 250)
+				const snapshot = instance.getMuteSnapshot(slot)
+				if (!snapshot) {
+					instance.log('warn', `Restore Mute State: no snapshot named "${slot}" - capture one first.`)
+					return
+				}
+				// Collect every key that drifted from the snapshot, then put them all back
+				// in one batch so an undo lands at once rather than key by key.
+				const restored: number[] = []
+				const unknown: number[] = []
+				for (const [keyNumber, wasMuted] of snapshot) {
+					const current = instance.getKeyMuted(keyNumber)
+					if (current === undefined) {
+						unknown.push(keyNumber)
+						continue
+					}
+					if (current === wasMuted) continue
+					restored.push(keyNumber)
+				}
+				if (restored.length > 0) {
+					await instance.toggleKeyMutes(0, restored, durationMs)
+				}
+				if (unknown.length > 0) {
+					instance.log('warn', `Restore Mute State: state unknown for key(s) ${unknown.join(',')} - not restored.`)
+				}
+				instance.log(
+					'info',
+					`Restore Mute State "${slot}": restored ${
+						restored.length > 0 ? restored.join(',') : 'nothing (already matches the snapshot)'
+					}`,
+				)
+			},
+		},
+		clearMuteSnapshot: {
+			name: 'Clear Mute Snapshot',
+			description: 'Discard a stored mute snapshot.',
+			options: [
+				{
+					type: 'textinput',
+					label: 'Snapshot name',
+					id: 'slot',
+					default: 'default',
+					useVariables: true,
+				},
+			],
+			callback: async (action, context) => {
+				const slot =
+					(await context.parseVariablesInString(String(action.options.slot ?? 'default'))).trim() || 'default'
+				const existed = instance.clearMuteSnapshot(slot)
+				instance.log('info', `Clear Mute Snapshot: "${slot}" ${existed ? 'cleared' : 'did not exist'}`)
+			},
+		},
+
+		// Volume (per-key rotary encoder)
+		adjustKeyVolume: {
+			name: 'Adjust Key Volume',
+			description:
+				'Turn a key\'s volume encoder by a number of detents. Positive turns up, negative turns down. Roughly 40 detents covers the full range. Relative only - the panel has no "set volume to X" command.',
+			options: [
+				{
+					type: 'dropdown',
+					label: 'Panel',
+					id: 'panelId',
+					default: 0,
+					choices: PANEL_CHOICES,
+				},
+				{
+					type: 'textinput',
+					label: 'Key Number (1 - 32)',
+					id: 'keyNumber',
+					default: '1',
+					useVariables: true,
+				},
+				{
+					type: 'number',
+					label: 'Steps (negative turns down)',
+					id: 'steps',
+					default: 1,
+					min: -40,
+					max: 40,
+				},
+			],
+			callback: async (action, context) => {
+				const panelId = Number(action.options.panelId ?? 0)
+				const keyNumber = parseInt(await context.parseVariablesInString(String(action.options.keyNumber ?? '1')), 10)
+				const steps = Number(action.options.steps ?? 1)
+				if (isNaN(keyNumber)) {
+					instance.log('warn', 'Adjust Key Volume: invalid key number')
+					return
+				}
+				await instance.adjustKeyVolumes(panelId, [keyNumber], steps)
+			},
+		},
+		adjustKeyVolumeMultiple: {
+			name: 'Adjust Volume on Multiple Keys (ganged trim)',
+			description:
+				'Trim a whole group of keys by the same number of detents in one action, e.g. "1-8". Every key moves together, so the balance between them is preserved. Relative only.',
+			options: [
+				{
+					type: 'dropdown',
+					label: 'Panel',
+					id: 'panelId',
+					default: 0,
+					choices: PANEL_CHOICES,
+				},
+				{
+					type: 'textinput',
+					label: 'Keys (e.g. 1-8 or 1,3,5-7)',
+					id: 'keys',
+					default: '1-8',
+					useVariables: true,
+				},
+				{
+					type: 'number',
+					label: 'Steps (negative turns down)',
+					id: 'steps',
+					default: 1,
+					min: -40,
+					max: 40,
+				},
+			],
+			callback: async (action, context) => {
+				const panelId = Number(action.options.panelId ?? 0)
+				const spec = await context.parseVariablesInString(String(action.options.keys ?? ''))
+				const keys = parseKeySpec(spec)
+				const steps = Number(action.options.steps ?? 1)
+				if (keys.length === 0) {
+					instance.log('warn', `Adjust Volume on Multiple Keys: no valid keys in "${spec}"`)
+					return
+				}
+				await instance.adjustKeyVolumes(panelId, keys, steps)
+				instance.log(
+					'info',
+					`Adjust Volume on Multiple Keys: ${steps > 0 ? '+' : ''}${steps} to key(s) ${keys.join(',')}`,
+				)
 			},
 		},
 	}

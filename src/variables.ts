@@ -1,7 +1,7 @@
 import { CompanionVariableDefinition, CompanionVariableValues } from '@companion-module/base'
 
 export function getVariableDefinitions(): CompanionVariableDefinition[] {
-	return [
+	const defs: CompanionVariableDefinition[] = [
 		{
 			name: 'Connection Status',
 			variableId: 'connection_status',
@@ -150,11 +150,92 @@ export function getVariableDefinitions(): CompanionVariableDefinition[] {
 			name: 'Identify Status',
 			variableId: 'identify_status',
 		},
+		// Key-press monitoring (from the /live-view connection). Key numbers are 1-based.
+		{
+			name: 'Last Lever Key (most recent lever event, 1-based)',
+			variableId: 'last_lever_key',
+		},
+		{
+			name: 'Last Lever State (Up / Down / Released)',
+			variableId: 'last_lever_state',
+		},
+		{
+			name: 'Last Lever Panel (0 = master, 1-4 = expansion)',
+			variableId: 'last_lever_panel',
+		},
+		{
+			name: 'Last Button Key (most recent encoder-push event, 1-based)',
+			variableId: 'last_button_key',
+		},
+		{
+			name: 'Last Button State (Pressed / Released)',
+			variableId: 'last_button_state',
+		},
+		{
+			name: 'Last Button Panel (0 = master, 1-4 = expansion)',
+			variableId: 'last_button_panel',
+		},
+		{
+			name: 'Muted Keys (comma-separated key numbers)',
+			variableId: 'muted_keys',
+		},
+		{
+			name: 'Muted Key Count',
+			variableId: 'muted_count',
+		},
+		{
+			name: 'Mute Snapshot: stored slot names',
+			variableId: 'mute_snapshot_slots',
+		},
+		{
+			name: 'Mute Snapshot: most recently captured slot',
+			variableId: 'mute_snapshot_last',
+		},
+		{
+			name: 'Mute Snapshot: keys that were muted in that snapshot',
+			variableId: 'mute_snapshot_last_muted',
+		},
+		{
+			name: 'Mute Snapshot: number of keys captured',
+			variableId: 'mute_snapshot_last_size',
+		},
+		{
+			name: 'Last Rotary Key (most recent encoder turn, 1-based)',
+			variableId: 'last_rotary_key',
+		},
+		{
+			name: 'Last Rotary Steps (+ up / - down)',
+			variableId: 'last_rotary_steps',
+		},
+		{
+			name: 'Last Rotary Panel (0 = master, 1-4 = expansion)',
+			variableId: 'last_rotary_panel',
+		},
+		{
+			name: 'Key Volumes (key:percent, comma-separated)',
+			variableId: 'volume_levels',
+		},
 	]
+	// Per-key mute state on the master panel, decoded from the rendered key displays.
+	// Empty string until the state is known (monitoring off, or key not on the
+	// currently displayed shift page).
+	for (let key = 1; key <= 32; key++) {
+		defs.push({
+			name: `Key ${key} Muted (true/false)`,
+			variableId: `key_${key}_muted`,
+		})
+		// Volume comes from the same decoded frames. Empty for an unassigned key,
+		// which draws no volume bar at all.
+		defs.push({
+			name: `Key ${key} Volume (0-100, empty if unassigned)`,
+			variableId: `key_${key}_volume`,
+		})
+	}
+	return defs
 }
 
 export function getDefaultVariableValues(): CompanionVariableValues {
-	return {
+	const values: CompanionVariableValues = {
 		connection_status: 'Disconnected',
 		media1_ip: 'Unknown',
 		config1_ip: 'Unknown',
@@ -190,5 +271,26 @@ export function getDefaultVariableValues(): CompanionVariableValues {
 		nmos_enabled: 'Unknown',
 		nmos_status: 'Unknown',
 		identify_status: 'Unknown',
+		last_lever_key: '',
+		last_lever_state: '',
+		last_lever_panel: '',
+		last_button_key: '',
+		last_button_state: '',
+		last_button_panel: '',
+		muted_keys: '',
+		muted_count: '0',
+		mute_snapshot_slots: '',
+		mute_snapshot_last: '',
+		mute_snapshot_last_muted: '',
+		mute_snapshot_last_size: '0',
+		last_rotary_key: '',
+		last_rotary_steps: '',
+		last_rotary_panel: '',
+		volume_levels: '',
 	}
+	for (let key = 1; key <= 32; key++) {
+		values[`key_${key}_muted`] = ''
+		values[`key_${key}_volume`] = ''
+	}
+	return values
 }

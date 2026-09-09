@@ -1,10 +1,18 @@
-import { InstanceBase, runEntrypoint, InstanceStatus, SomeCompanionConfigField } from '@companion-module/base'
+import {
+	InstanceBase,
+	runEntrypoint,
+	InstanceStatus,
+	SomeCompanionConfigField,
+	CompanionVariableValues,
+} from '@companion-module/base'
 import { getConfigFields, DeviceConfig } from './config.js'
 import { getActions } from './actions.js'
 import { getFeedbacks } from './feedbacks.js'
 import { getPresets } from './presets.js'
 import { getVariableDefinitions, getDefaultVariableValues } from './variables.js'
 import WebSocket from 'ws'
+import * as jpeg from 'jpeg-js'
+import { parseKeySpec } from './keys.js'
 
 interface NetworkTarget {
 	ip: string
@@ -65,8 +73,72 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 	private nmosStatus = 'Unknown'
 	private wasConnected = false
 
+	// --- Key-press monitoring via the /live-view WebSocket ---
+	// The panel's /live-view socket is bidirectional: alongside the SimulateButton/
+	// SimulateLever commands (see toggleKeyMuteAtIp) it *emits* LeverStateChanged and
+	// ButtonStateChanged notifications for every physical key actuation. We keep a
+	// second persistent connection open purely to surface those as variables/feedbacks,
+	// so a real panel key press can drive Companion logic. keyId is 0-based on the wire;
+	// we expose 1-based key numbers to match the mute actions.
+	private liveViewWs: WebSocket | null = null
+	private liveViewReconnectTimer: ReturnType<typeof setTimeout> | null = null
+	private liveViewWasConnected = false
+	// current state per `${panelId}:${keyId}` (0-based keyId)
+	private leverStates: Map<string, string> = new Map()
+	private buttonStates: Map<string, string> = new Map()
+
+	// --- Per-key mute state, decoded from the rendered key displays ---
+	// The panel exposes no mute field anywhere in its API, but it *renders* a red
+	// crossed-speaker glyph in the top-right of every muted key. RequestDisplayContent
+	// returns those keybank displays as JPEGs, and after SubscribePanelEvents the panel
+	// pushes an updated JPEG whenever a key's rendering changes (including mute). We
+	// decode the glyph region per key to recover true mute state, which lets the
+	// Set Key Mute actions be idempotent instead of blindly toggling.
+	// Master panel (panelId 0) only: the binary display frames carry a display index
+	// but no panelId, so we cannot attribute pushed frames to expansion panels.
+	private mutedKeys: Map<number, boolean> = new Map() // 0-based keyId -> muted
+	private static readonly MUTE_GRID_COLS = 8
+	private static readonly MUTE_GRID_ROWS = 2
+	private static readonly MUTE_RED_THRESHOLD = 0.02
+
+	// --- Per-key volume, decoded from the same rendered key displays ---
+	// Each key cell draws a filled volume bar across the lower third. There is no
+	// volume field in the API either (leverKeysRotary.stepsTurned is a last-turn
+	// delta that reads 0 at rest, not a position), so the rendered bar is the only
+	// way to recover an absolute level. We take the rightmost bright pixel on the
+	// bar row as the fill extent. An unassigned key draws no bar at all -> undefined.
+	private volumeLevels: Map<number, number> = new Map() // 0-based keyId -> 0..1
+	private static readonly VOLUME_BAR_TOP = 0.66
+	private static readonly VOLUME_BAR_BOTTOM = 0.74
+	private static readonly VOLUME_BAR_BRIGHT = 90
+	// One detent moves the bar ~2.5% of its width, so ignore smaller wobble as JPEG noise.
+	private static readonly VOLUME_EPSILON = 0.012
+
+	// Saved mute snapshots, so a "capture now / restore later" undo is possible.
+	// slot name -> (1-based keyNumber -> was muted). Held in memory only: a snapshot
+	// is a within-session undo point and is intentionally not persisted across a
+	// Companion restart.
+	private muteSnapshots: Map<string, Map<number, boolean>> = new Map()
+	private lastSnapshotSlot = ''
+
+	// Last values actually pushed to Companion, so we only send what changed.
+	// Every variable write crosses the IPC boundary into the shared Companion
+	// process; a fleet of panels all re-sending 64 unchanged values on every
+	// display frame adds up there, even though each module runs in its own process.
+	private publishedMute: Map<number, string> = new Map()
+	private publishedVolume: Map<number, string> = new Map()
+
 	constructor(internal: unknown) {
 		super(internal)
+	}
+
+	/**
+	 * Reconnect delay with jitter. Without it a switch reboot drops every panel at
+	 * once and they all retry in lockstep forever, hammering the network and each
+	 * panel in synchronised waves - the more panels, the worse it gets.
+	 */
+	private reconnectDelay(): number {
+		return 5000 + Math.floor(Math.random() * 2500)
 	}
 
 	async init(config: DeviceConfig): Promise<void> {
@@ -77,6 +149,7 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 		this.setVariableDefinitions(getVariableDefinitions())
 		this.setVariableValues(getDefaultVariableValues())
 		this.initWebSocket()
+		this.initLiveView()
 	}
 
 	async destroy(): Promise<void> {
@@ -89,6 +162,7 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 			this.ws.close()
 			this.ws = null
 		}
+		this.closeLiveView()
 	}
 
 	async configUpdated(config: DeviceConfig): Promise<void> {
@@ -98,6 +172,7 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 			this.ws.close()
 		}
 		this.initWebSocket()
+		this.initLiveView()
 	}
 
 	getConfigFields(): SomeCompanionConfigField[] {
@@ -225,14 +300,350 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 				this.checkFeedbacks('connectionStatus')
 				if (!this.reconnectTimer) {
 					this.reconnectTimer = setTimeout(() => {
+						this.reconnectTimer = null
 						this.initWebSocket()
-					}, 5000)
+					}, this.reconnectDelay())
 				}
 			})
 		} catch (error) {
 			this.log('error', `Failed to create WebSocket: ${error}`)
 			this.updateStatus(InstanceStatus.ConnectionFailure, String(error))
 		}
+	}
+
+	// Second persistent connection to /live-view purely to receive key-press
+	// notifications. It is independent of the main /websocket status link and only
+	// logs at debug level so a flaky live-view socket never masks the real status.
+	private initLiveView(): void {
+		// Opt-in: anything other than an explicit true (including a connection
+		// upgraded from an older version, which has no such setting saved) leaves
+		// the panel completely untouched.
+		if (this.config.enableKeyEvents !== true) {
+			this.closeLiveView()
+			return
+		}
+		this.liveViewWasConnected = false
+		if (this.liveViewReconnectTimer) {
+			clearTimeout(this.liveViewReconnectTimer)
+			this.liveViewReconnectTimer = null
+		}
+		const target = this.parseIpAndPort()
+		if (!target || !target.ip || !target.port) {
+			return // main connection already surfaces BadConfig
+		}
+		if (this.liveViewWs) {
+			this.liveViewWs.removeAllListeners()
+			this.liveViewWs.close()
+			this.liveViewWs = null
+		}
+		const url = `ws://${target.ip}:${target.port}/live-view`
+		try {
+			this.liveViewWs = new WebSocket(url)
+			this.liveViewWs.on('open', () => {
+				this.log('info', 'LiveView (key events) connected')
+				this.liveViewWasConnected = true
+				// Subscribing makes the panel push key events *and* an updated display
+				// image whenever a key's rendering changes (including mute).
+				this.sendLiveView('/LiveView/SubscribePanelEvents', { panelId: 0 })
+				if (this.config.enableMuteState === true) {
+					// One-shot snapshot so mute state is known before anything changes.
+					this.sendLiveView('/LiveView/RequestDisplayContent', { panelId: 0 })
+				}
+			})
+			this.liveViewWs.on('message', (data: WebSocket.Data, isBinary: boolean) => {
+				const buf = Buffer.isBuffer(data)
+					? data
+					: Array.isArray(data)
+						? Buffer.concat(data)
+						: typeof data === 'string'
+							? Buffer.from(data, 'utf8')
+							: Buffer.from(data)
+				// Display content arrives as binary frames; everything else is JSON text.
+				// 0x7b === '{' guards the case where isBinary is not supplied.
+				if (isBinary || (buf.length > 4 && buf[0] !== 0x7b)) {
+					if (this.config.enableMuteState === true) {
+						this.handleDisplayFrame(buf)
+					}
+					return
+				}
+				this.handleLiveViewMessage(buf.toString('utf8'))
+			})
+			this.liveViewWs.on('error', (error: Error) => {
+				this.log('debug', `LiveView error: ${error.message}`)
+			})
+			this.liveViewWs.on('close', () => {
+				if (this.liveViewWasConnected) {
+					this.log('debug', 'LiveView (key events) disconnected')
+				}
+				this.liveViewWasConnected = false
+				if (this.config.enableKeyEvents === true && !this.liveViewReconnectTimer) {
+					this.liveViewReconnectTimer = setTimeout(() => {
+						this.liveViewReconnectTimer = null
+						this.initLiveView()
+					}, this.reconnectDelay())
+				}
+			})
+		} catch (error) {
+			this.log('debug', `Failed to create LiveView WebSocket: ${error}`)
+		}
+	}
+
+	private closeLiveView(): void {
+		if (this.liveViewReconnectTimer) {
+			clearTimeout(this.liveViewReconnectTimer)
+			this.liveViewReconnectTimer = null
+		}
+		if (this.liveViewWs) {
+			this.liveViewWs.removeAllListeners()
+			this.liveViewWs.close()
+			this.liveViewWs = null
+		}
+		this.liveViewWasConnected = false
+	}
+
+	private sendLiveView(topic: string, body: Record<string, unknown>): void {
+		if (!this.liveViewWs || this.liveViewWs.readyState !== WebSocket.OPEN) return
+		try {
+			this.liveViewWs.send(JSON.stringify({ topic, body }))
+		} catch (error) {
+			this.log('debug', `LiveView send failed: ${error}`)
+		}
+	}
+
+	// Decode a pushed display frame and recover per-key mute state.
+	// Frame layout: uint16 displayIndex | uint16 mimeLen | mime | <image bytes>
+	// Display 0 = keys 1-16, display 1 = keys 17-32 (8 cols x 2 rows each).
+	// Display 2 is the centre info screen and carries no key cells.
+	private handleDisplayFrame(buf: Buffer): void {
+		if (buf.length < 6) return
+		const displayIndex = buf.readUInt16BE(0)
+		const mimeLen = buf.readUInt16BE(2)
+		if (buf.length < 4 + mimeLen) return
+		const mime = buf.subarray(4, 4 + mimeLen).toString('ascii')
+		if (!mime.includes('jp')) return // image/jpg or image/jpeg
+		if (displayIndex !== 0 && displayIndex !== 1) return // keybank displays only
+		const payload = buf.subarray(4 + mimeLen)
+		let img: jpeg.RawImageData<Uint8Array>
+		try {
+			img = jpeg.decode(payload, { useTArray: true })
+		} catch (error) {
+			this.log('debug', `Display decode failed: ${error}`)
+			return
+		}
+		const cols = RiedelRSP1232HLInstance.MUTE_GRID_COLS
+		const rows = RiedelRSP1232HLInstance.MUTE_GRID_ROWS
+		const cw = img.width / cols
+		const ch = img.height / rows
+		const baseKey = displayIndex * cols * rows
+		let changed = false
+		let volumeChanged = false
+		for (let row = 0; row < rows; row++) {
+			for (let col = 0; col < cols; col++) {
+				const keyId = baseKey + row * cols + col
+				const x0 = col * cw
+				const y0 = row * ch
+				// the mute glyph sits in the top-right corner of the key cell
+				const frac = this.glyphFraction(
+					img,
+					Math.floor(x0 + cw * 0.72),
+					Math.floor(y0 + ch * 0.02),
+					Math.floor(x0 + cw * 0.99),
+					Math.floor(y0 + ch * 0.3),
+				)
+				const muted = frac > RiedelRSP1232HLInstance.MUTE_RED_THRESHOLD
+				if (this.mutedKeys.get(keyId) !== muted) changed = true
+				this.mutedKeys.set(keyId, muted)
+
+				const level = this.barFraction(img, x0, y0, cw, ch)
+				const previous = this.volumeLevels.get(keyId)
+				if (level === undefined) {
+					if (previous !== undefined) {
+						this.volumeLevels.delete(keyId)
+						volumeChanged = true
+					}
+				} else if (previous === undefined || Math.abs(previous - level) > RiedelRSP1232HLInstance.VOLUME_EPSILON) {
+					this.volumeLevels.set(keyId, level)
+					volumeChanged = true
+				}
+			}
+		}
+		if (changed) this.publishMuteState()
+		if (volumeChanged) this.publishVolumeState()
+	}
+
+	// Fraction of strongly-red pixels in a box. The mute glyph is bright red on both
+	// the dark and the light ("active") key backgrounds, so this separates cleanly.
+	private glyphFraction(img: jpeg.RawImageData<Uint8Array>, xs: number, ys: number, xe: number, ye: number): number {
+		const x1 = Math.max(0, xs)
+		const y1 = Math.max(0, ys)
+		const x2 = Math.min(img.width, xe)
+		const y2 = Math.min(img.height, ye)
+		let hits = 0
+		let total = 0
+		for (let y = y1; y < y2; y++) {
+			for (let x = x1; x < x2; x++) {
+				const o = (y * img.width + x) * 4
+				const r = img.data[o]
+				const g = img.data[o + 1]
+				const b = img.data[o + 2]
+				total++
+				if (r > 140 && r - g > 60 && r - b > 40) hits++
+			}
+		}
+		return total > 0 ? hits / total : 0
+	}
+
+	// Fill extent of a key's volume bar, as a fraction of the cell width, or undefined
+	// when the key draws no bar (unassigned key). Scans the bar rows for the rightmost
+	// bright pixel: the bar is drawn bright up to the level and dark beyond it.
+	private barFraction(
+		img: jpeg.RawImageData<Uint8Array>,
+		cellX: number,
+		cellY: number,
+		cellW: number,
+		cellH: number,
+	): number | undefined {
+		const y1 = Math.max(0, Math.floor(cellY + cellH * RiedelRSP1232HLInstance.VOLUME_BAR_TOP))
+		const y2 = Math.min(img.height, Math.floor(cellY + cellH * RiedelRSP1232HLInstance.VOLUME_BAR_BOTTOM))
+		// Skip the cell's own border on both sides, which is bright on a selected key.
+		const x1 = Math.max(0, Math.floor(cellX + cellW * 0.05))
+		const x2 = Math.min(img.width, Math.floor(cellX + cellW * 0.97))
+		let rightmost = -1
+		for (let x = x1; x < x2; x++) {
+			for (let y = y1; y < y2; y++) {
+				const o = (y * img.width + x) * 4
+				const mean = (img.data[o] + img.data[o + 1] + img.data[o + 2]) / 3
+				if (mean > RiedelRSP1232HLInstance.VOLUME_BAR_BRIGHT) {
+					rightmost = x
+					break
+				}
+			}
+		}
+		if (rightmost < 0) return undefined
+		return (rightmost - cellX) / cellW
+	}
+
+	private publishVolumeState(): void {
+		const values: CompanionVariableValues = {}
+		const summary: string[] = []
+		for (let keyId = 0; keyId < 32; keyId++) {
+			const level = this.volumeLevels.get(keyId)
+			const text = level === undefined ? '' : String(Math.round(level * 100))
+			if (this.publishedVolume.get(keyId) !== text) {
+				values[`key_${keyId + 1}_volume`] = text
+				this.publishedVolume.set(keyId, text)
+			}
+			if (text !== '') summary.push(`${keyId + 1}:${text}`)
+		}
+		values.volume_levels = summary.join(',')
+		this.setVariableValues(values)
+		this.checkFeedbacks('keyVolume')
+	}
+
+	private publishMuteState(): void {
+		const values: CompanionVariableValues = {}
+		const mutedList: number[] = []
+		for (let keyId = 0; keyId < 32; keyId++) {
+			const muted = this.mutedKeys.get(keyId)
+			const text = muted === undefined ? '' : muted ? 'true' : 'false'
+			if (this.publishedMute.get(keyId) !== text) {
+				values[`key_${keyId + 1}_muted`] = text
+				this.publishedMute.set(keyId, text)
+			}
+			if (muted) mutedList.push(keyId + 1)
+		}
+		values.muted_keys = mutedList.join(',')
+		values.muted_count = String(mutedList.length)
+		this.setVariableValues(values)
+		// A restore button's "differs from snapshot" styling depends on live mute state.
+		this.checkFeedbacks('keyMuted', 'muteSnapshotDiffers')
+	}
+
+	private handleLiveViewMessage(message: string): void {
+		let data: WebSocketMessage
+		try {
+			data = JSON.parse(message)
+		} catch {
+			return
+		}
+		const topic = data.topic
+		const body = data.body ?? {}
+		if (topic === '/LiveView/LeverStateChanged') {
+			const panelId = Number(body.panelId ?? 0)
+			const keyId = Number(body.keyId)
+			const leverState = typeof body.leverState === 'string' ? body.leverState : ''
+			if (Number.isNaN(keyId)) return
+			this.leverStates.set(`${panelId}:${keyId}`, leverState)
+			this.setVariableValues({
+				last_lever_panel: String(panelId),
+				last_lever_key: String(keyId + 1), // expose 1-based to match the mute actions
+				last_lever_state: leverState,
+			})
+			this.checkFeedbacks('keyLeverState')
+		} else if (topic === '/LiveView/ButtonStateChanged') {
+			const panelId = Number(body.panelId ?? 0)
+			const keyId = Number(body.keyId)
+			const buttonState = typeof body.buttonState === 'string' ? body.buttonState : ''
+			if (Number.isNaN(keyId)) return
+			this.buttonStates.set(`${panelId}:${keyId}`, buttonState)
+			this.setVariableValues({
+				last_button_panel: String(panelId),
+				last_button_key: String(keyId + 1),
+				last_button_state: buttonState,
+			})
+			this.checkFeedbacks('keyButtonState')
+		} else if (topic === '/LiveView/LeverKeyRotaryTurned') {
+			const panelId = Number(body.panelId ?? 0)
+			const keyId = Number(body.keyId)
+			const steps = Number(body.stepsTurned ?? 0)
+			if (Number.isNaN(keyId) || steps === 0) return
+			this.setVariableValues({
+				last_rotary_panel: String(panelId),
+				last_rotary_key: String(keyId + 1),
+				last_rotary_steps: String(steps),
+			})
+			this.applyRotaryGang(panelId, keyId, steps)
+		}
+		// Other /live-view topics (e.g. LeverKeyLedRingStateChanged) are high-frequency
+		// ring-colour updates we intentionally ignore.
+	}
+
+	/**
+	 * Ganged volume trim: when the configured source key's encoder is turned, pass the
+	 * same relative step to every target key, so a group of conferences moves together
+	 * and keeps its existing balance.
+	 *
+	 * Sent on the already-open live-view socket rather than a fresh connection - a spin
+	 * emits a burst of detents and a connect per detent would lag badly.
+	 */
+	private applyRotaryGang(panelId: number, keyId: number, steps: number): void {
+		if (this.config.enableRotaryGang !== true) return
+		if (panelId !== Number(this.config.gangSourcePanel ?? 0)) return
+		if (keyId !== Number(this.config.gangSourceKey ?? 1) - 1) return
+
+		const targetPanel = Number(this.config.gangTargetPanel ?? 0)
+		const targets = parseKeySpec(String(this.config.gangTargetKeys ?? ''))
+		if (targets.length === 0) return
+
+		const socket = this.liveViewWs
+		if (!socket || socket.readyState !== WebSocket.OPEN) {
+			this.log('debug', 'Rotary gang: live-view socket not open, dropping step')
+			return
+		}
+		let sent = 0
+		for (const keyNumber of targets) {
+			// Never echo a step back to the source key: the panel would broadcast that
+			// as another LeverKeyRotaryTurned and we would gang off our own output.
+			if (targetPanel === panelId && keyNumber - 1 === keyId) continue
+			socket.send(
+				JSON.stringify({
+					topic: '/LiveView/SimulateLeverKeyRotary',
+					body: { panelId: targetPanel, keyId: keyNumber - 1, stepsTurned: steps },
+				}),
+			)
+			sent++
+		}
+		this.log('debug', `Rotary gang: ${steps > 0 ? '+' : ''}${steps} to ${sent} key(s) on panel ${targetPanel}`)
 	}
 
 	private handleMessage(message: string): void {
@@ -881,45 +1292,106 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 	}
 
 	public async toggleKeyMute(panelId: number, keyNumber: number, durationMs = 250): Promise<void> {
+		await this.toggleKeyMutes(panelId, [keyNumber], durationMs)
+	}
+
+	public async toggleKeyMutes(panelId: number, keyNumbers: number[], durationMs = 250): Promise<void> {
 		const target = this.parseIpAndPort()
 		if (!target || !target.ip) {
 			this.log('warn', 'Toggle Key Mute: no host configured')
 			return
 		}
-		await this.toggleKeyMuteAtIp(target.ip, panelId, keyNumber, durationMs)
+		await this.toggleKeyMutesAtIp(target.ip, panelId, keyNumbers, durationMs)
 	}
 
 	public async toggleKeyMuteAtIp(host: string, panelId: number, keyNumber: number, durationMs = 250): Promise<void> {
-		if (keyNumber < 1) {
-			this.log('warn', `Invalid key number: ${keyNumber}. Must be >= 1`)
-			return
+		await this.toggleKeyMutesAtIp(host, panelId, [keyNumber], durationMs)
+	}
+
+	/**
+	 * Toggle a set of keys in ONE live-view session: all keys are pressed together,
+	 * held once, then released together. Toggling them one at a time instead would
+	 * open a socket and serve a full hold per key, which makes a batch of eight take
+	 * several seconds and visibly cascade down the panel.
+	 */
+	public async toggleKeyMutesAtIp(
+		host: string,
+		panelId: number,
+		keyNumbers: number[],
+		durationMs = 250,
+	): Promise<void> {
+		const keyIds: number[] = []
+		for (const keyNumber of keyNumbers) {
+			if (keyNumber < 1) {
+				this.log('warn', `Invalid key number: ${keyNumber}. Must be >= 1`)
+				continue
+			}
+			keyIds.push(keyNumber - 1)
 		}
-		const keyId = keyNumber - 1
+		if (keyIds.length === 0) return
+
 		await this.runLiveViewCommand(host, async (socket) => {
-			const sendMsg = (topic: string, body: Record<string, unknown>) => {
-				socket.send(JSON.stringify({ topic, body }))
+			// One JSON message per frame - the panel rejects arrays and newline-separated batches.
+			const sendAll = (buttonState: 'Pressed' | 'Released') => {
+				for (const keyId of keyIds) {
+					socket.send(JSON.stringify({ topic: '/LiveView/SimulateButton', body: { panelId, keyId, buttonState } }))
+				}
 			}
 
-			// Press
-			sendMsg('/LiveView/SimulateButton', {
-				panelId,
-				keyId,
-				buttonState: 'Pressed',
-			})
+			sendAll('Pressed')
 
-			// Hold duration (minimum 200ms required by panel firmware)
+			// Hold duration (minimum 200ms required by panel firmware), served once for the whole batch
 			await new Promise((resolve) => setTimeout(resolve, Math.max(durationMs, 200)))
 
-			// Release
-			sendMsg('/LiveView/SimulateButton', {
-				panelId,
-				keyId,
-				buttonState: 'Released',
-			})
+			sendAll('Released')
+		})
+	}
+
+	/**
+	 * Nudge the volume of one or more keys by a relative number of detents.
+	 *
+	 * The panel has no absolute "set volume" command - leverKeysRotary.stepsTurned is a
+	 * last-turn delta, not a position - so volume is only ever moved relatively. Sending
+	 * the same step to a set of keys therefore trims them as a group while preserving
+	 * whatever balance they already had.
+	 *
+	 * All the keys go out over a single live-view session, reusing the persistent
+	 * monitoring socket when one is open so a spin does not pay a connect per detent.
+	 */
+	public async adjustKeyVolumes(panelId: number, keyNumbers: number[], steps: number): Promise<void> {
+		if (steps === 0 || keyNumbers.length === 0) return
+		const keyIds = keyNumbers.filter((keyNumber) => keyNumber >= 1).map((keyNumber) => keyNumber - 1)
+		if (keyIds.length === 0) return
+
+		const frames = keyIds.map((keyId) =>
+			JSON.stringify({
+				topic: '/LiveView/SimulateLeverKeyRotary',
+				body: { panelId, keyId, stepsTurned: steps },
+			}),
+		)
+
+		const live = this.liveViewWs
+		if (live && live.readyState === WebSocket.OPEN) {
+			for (const frame of frames) live.send(frame)
+			return
+		}
+
+		const target = this.parseIpAndPort()
+		if (!target || !target.ip) {
+			this.log('warn', 'Adjust Key Volume: no host configured')
+			return
+		}
+		await this.runLiveViewCommand(target.ip, async (socket) => {
+			for (const frame of frames) socket.send(frame)
 		})
 	}
 
 	// Getter methods for feedbacks
+	public getKeyVolume(keyNumber: number): number | undefined {
+		const level = this.volumeLevels.get(keyNumber - 1)
+		return level === undefined ? undefined : Math.round(level * 100)
+	}
+
 	public isConnected(): boolean {
 		return this.ws !== null && this.ws.readyState === WebSocket.OPEN
 	}
@@ -958,6 +1430,98 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 
 	public getNmosEnabled(): boolean {
 		return this.nmosEnabled
+	}
+
+	// Key-event getters (keyNumber is 1-based to match the mute actions)
+	public getLeverState(panelId: number, keyNumber: number): string | undefined {
+		return this.leverStates.get(`${panelId}:${keyNumber - 1}`)
+	}
+
+	public getButtonState(panelId: number, keyNumber: number): string | undefined {
+		return this.buttonStates.get(`${panelId}:${keyNumber - 1}`)
+	}
+
+	/**
+	 * True/false if the key's mute state is known, undefined if it isn't yet
+	 * (mute monitoring disabled, key on another shift page, or no snapshot yet).
+	 * Master panel only. keyNumber is 1-based.
+	 */
+	public getKeyMuted(keyNumber: number): boolean | undefined {
+		return this.mutedKeys.get(keyNumber - 1)
+	}
+
+	/**
+	 * Snapshot the current mute state so it can be restored later.
+	 * Pass a list of 1-based key numbers, or null for every key whose state is known.
+	 * Keys with unknown state cannot be captured and are reported back to the caller.
+	 */
+	public captureMuteSnapshot(slot: string, keys: number[] | null): { captured: number[]; unknown: number[] } {
+		const candidates = keys && keys.length > 0 ? keys : Array.from({ length: 32 }, (_, i) => i + 1)
+		const snapshot = new Map<number, boolean>()
+		const captured: number[] = []
+		const unknown: number[] = []
+		for (const keyNumber of candidates) {
+			const muted = this.mutedKeys.get(keyNumber - 1)
+			if (muted === undefined) {
+				unknown.push(keyNumber)
+				continue
+			}
+			snapshot.set(keyNumber, muted)
+			captured.push(keyNumber)
+		}
+		if (snapshot.size > 0) {
+			this.muteSnapshots.set(slot, snapshot)
+			this.lastSnapshotSlot = slot
+			this.publishSnapshotState()
+			this.checkFeedbacks('muteSnapshotDiffers')
+		}
+		return { captured, unknown }
+	}
+
+	/** The stored snapshot for a slot: 1-based keyNumber -> was muted. */
+	public getMuteSnapshot(slot: string): Map<number, boolean> | undefined {
+		return this.muteSnapshots.get(slot)
+	}
+
+	public clearMuteSnapshot(slot: string): boolean {
+		const existed = this.muteSnapshots.delete(slot)
+		if (existed) {
+			if (this.lastSnapshotSlot === slot) this.lastSnapshotSlot = ''
+			this.publishSnapshotState()
+			this.checkFeedbacks('muteSnapshotDiffers')
+		}
+		return existed
+	}
+
+	/**
+	 * True when a snapshot exists and at least one of its keys is currently in a
+	 * different state - i.e. restoring it would actually change something. Lets a
+	 * restore button light up only when there is something to undo.
+	 */
+	public muteSnapshotDiffers(slot: string): boolean {
+		const snapshot = this.muteSnapshots.get(slot)
+		if (!snapshot) return false
+		for (const [keyNumber, wasMuted] of snapshot) {
+			const current = this.mutedKeys.get(keyNumber - 1)
+			if (current !== undefined && current !== wasMuted) return true
+		}
+		return false
+	}
+
+	private publishSnapshotState(): void {
+		const last = this.muteSnapshots.get(this.lastSnapshotSlot)
+		const lastMuted = last
+			? [...last.entries()]
+					.filter(([, muted]) => muted)
+					.map(([keyNumber]) => keyNumber)
+					.sort((a, b) => a - b)
+			: []
+		this.setVariableValues({
+			mute_snapshot_slots: [...this.muteSnapshots.keys()].join(','),
+			mute_snapshot_last: this.lastSnapshotSlot,
+			mute_snapshot_last_muted: lastMuted.join(','),
+			mute_snapshot_last_size: String(last ? last.size : 0),
+		})
 	}
 }
 
