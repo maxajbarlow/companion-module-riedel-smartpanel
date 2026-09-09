@@ -692,6 +692,51 @@ export function getFeedbacks(instance: RiedelRSP1232HLInstance): CompanionFeedba
 				return feedback.options.state === 'muted' ? muted : !muted
 			},
 		},
+		keyVolume: {
+			type: 'boolean',
+			name: 'Key Volume',
+			description:
+				'Compare a key\'s volume (0-100) against a threshold. Decoded from the rendered volume bar. False for an unassigned key, which draws no bar. Requires "Monitor mute state and volume"; master panel, currently displayed shift page.',
+			defaultStyle: {
+				color: 0xffffff,
+				bgcolor: 0x0066ff,
+			},
+			options: [
+				{
+					type: 'number',
+					label: 'Key Number (1 - 32)',
+					id: 'keyNumber',
+					default: 1,
+					min: 1,
+					max: 32,
+				},
+				{
+					type: 'dropdown',
+					label: 'Show when volume is',
+					id: 'op',
+					default: 'lte',
+					choices: [
+						{ id: 'lte', label: 'At or below' },
+						{ id: 'gte', label: 'At or above' },
+					],
+				},
+				{
+					type: 'number',
+					label: 'Threshold (0 - 100)',
+					id: 'threshold',
+					default: 20,
+					min: 0,
+					max: 100,
+				},
+			],
+			callback: (feedback) => {
+				const keyNumber = Number(feedback.options.keyNumber ?? 1)
+				const volume = instance.getKeyVolume(keyNumber)
+				if (volume === undefined) return false // unassigned key, or level not known yet
+				const threshold = Number(feedback.options.threshold ?? 0)
+				return feedback.options.op === 'gte' ? volume >= threshold : volume <= threshold
+			},
+		},
 		muteSnapshotDiffers: {
 			type: 'boolean',
 			name: 'Mute Snapshot Differs (restore available)',

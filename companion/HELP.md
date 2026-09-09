@@ -79,6 +79,27 @@ A typical "focus" button pair:
 
 Because the capture happens first, Restore returns each key to whatever it was **before** you focused — not blanket-unmuted. Add the **Mute Snapshot Differs** feedback to the Restore button so it only lights up when there is actually something to undo.
 
+### Volume (ganged trim)
+
+Each key has its own rotary encoder that sets that conference's listen level.
+
+- **Adjust Key Volume**: Turn one key's encoder by a number of detents. Positive turns up, negative down.
+- **Adjust Volume on Multiple Keys (ganged trim)**: Trim a whole group by the same amount in one action — `1-8`, `1,3,5-7`. Every key moves together over a single connection.
+
+> **Volume is relative, not absolute.** The panel has no "set volume to X" command, and `leverKeysRotary.stepsTurned` reports the *last turn*, not a position. So these actions nudge; they do not set. That is usually what you want for a group — a trim moves everything together and **preserves the balance** between the keys, rather than flattening them to one level. Roughly **40 detents** covers the full range (~2.5% per detent).
+
+#### Ganging a physical rotary to a group
+
+Set this up in the connection config, not as a trigger — a spin emits a burst of detents and a Companion round-trip per detent would lag.
+
+1. Tick **Monitor key presses**, then **Gang one rotary to several keys**.
+2. Set the **source** panel and key — the encoder you want to turn.
+3. Set the **target** panel and keys — the group that should follow.
+
+Turning the source key's encoder then passes the same step to every target key. For example, source _Expansion Panel 2 / key 1_ with targets _Master Panel / `1-8`_ lets one knob ride all eight conferences at once.
+
+The source key is automatically excluded when it appears in its own target set, otherwise the panel's echo of our own step would feed straight back in.
+
 > Snapshots are held **in memory** — they are a within-session undo point and do not survive a Companion restart or a connection reload. Capturing again under the same name overwrites it.
 
 ### Key-Press Monitoring

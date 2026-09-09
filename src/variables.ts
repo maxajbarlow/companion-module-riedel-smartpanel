@@ -199,6 +199,22 @@ export function getVariableDefinitions(): CompanionVariableDefinition[] {
 			name: 'Mute Snapshot: number of keys captured',
 			variableId: 'mute_snapshot_last_size',
 		},
+		{
+			name: 'Last Rotary Key (most recent encoder turn, 1-based)',
+			variableId: 'last_rotary_key',
+		},
+		{
+			name: 'Last Rotary Steps (+ up / - down)',
+			variableId: 'last_rotary_steps',
+		},
+		{
+			name: 'Last Rotary Panel (0 = master, 1-4 = expansion)',
+			variableId: 'last_rotary_panel',
+		},
+		{
+			name: 'Key Volumes (key:percent, comma-separated)',
+			variableId: 'volume_levels',
+		},
 	]
 	// Per-key mute state on the master panel, decoded from the rendered key displays.
 	// Empty string until the state is known (monitoring off, or key not on the
@@ -207,6 +223,12 @@ export function getVariableDefinitions(): CompanionVariableDefinition[] {
 		defs.push({
 			name: `Key ${key} Muted (true/false)`,
 			variableId: `key_${key}_muted`,
+		})
+		// Volume comes from the same decoded frames. Empty for an unassigned key,
+		// which draws no volume bar at all.
+		defs.push({
+			name: `Key ${key} Volume (0-100, empty if unassigned)`,
+			variableId: `key_${key}_volume`,
 		})
 	}
 	return defs
@@ -261,9 +283,14 @@ export function getDefaultVariableValues(): CompanionVariableValues {
 		mute_snapshot_last: '',
 		mute_snapshot_last_muted: '',
 		mute_snapshot_last_size: '0',
+		last_rotary_key: '',
+		last_rotary_steps: '',
+		last_rotary_panel: '',
+		volume_levels: '',
 	}
 	for (let key = 1; key <= 32; key++) {
 		values[`key_${key}_muted`] = ''
+		values[`key_${key}_volume`] = ''
 	}
 	return values
 }

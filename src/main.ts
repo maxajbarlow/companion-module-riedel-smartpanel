@@ -12,6 +12,7 @@ import { getPresets } from './presets.js'
 import { getVariableDefinitions, getDefaultVariableValues } from './variables.js'
 import WebSocket from 'ws'
 import * as jpeg from 'jpeg-js'
+import { parseKeySpec } from './keys.js'
 
 interface NetworkTarget {
 	ip: string
@@ -99,6 +100,19 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 	private static readonly MUTE_GRID_COLS = 8
 	private static readonly MUTE_GRID_ROWS = 2
 	private static readonly MUTE_RED_THRESHOLD = 0.02
+
+	// --- Per-key volume, decoded from the same rendered key displays ---
+	// Each key cell draws a filled volume bar across the lower third. There is no
+	// volume field in the API either (leverKeysRotary.stepsTurned is a last-turn
+	// delta that reads 0 at rest, not a position), so the rendered bar is the only
+	// way to recover an absolute level. We take the rightmost bright pixel on the
+	// bar row as the fill extent. An unassigned key draws no bar at all -> undefined.
+	private volumeLevels: Map<number, number> = new Map() // 0-based keyId -> 0..1
+	private static readonly VOLUME_BAR_TOP = 0.66
+	private static readonly VOLUME_BAR_BOTTOM = 0.74
+	private static readonly VOLUME_BAR_BRIGHT = 90
+	// One detent moves the bar ~2.5% of its width, so ignore smaller wobble as JPEG noise.
+	private static readonly VOLUME_EPSILON = 0.012
 
 	// Saved mute snapshots, so a "capture now / restore later" undo is possible.
 	// slot name -> (1-based keyNumber -> was muted). Held in memory only: a snapshot
@@ -405,6 +419,7 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 		const ch = img.height / rows
 		const baseKey = displayIndex * cols * rows
 		let changed = false
+		let volumeChanged = false
 		for (let row = 0; row < rows; row++) {
 			for (let col = 0; col < cols; col++) {
 				const keyId = baseKey + row * cols + col
@@ -421,9 +436,22 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 				const muted = frac > RiedelRSP1232HLInstance.MUTE_RED_THRESHOLD
 				if (this.mutedKeys.get(keyId) !== muted) changed = true
 				this.mutedKeys.set(keyId, muted)
+
+				const level = this.barFraction(img, x0, y0, cw, ch)
+				const previous = this.volumeLevels.get(keyId)
+				if (level === undefined) {
+					if (previous !== undefined) {
+						this.volumeLevels.delete(keyId)
+						volumeChanged = true
+					}
+				} else if (previous === undefined || Math.abs(previous - level) > RiedelRSP1232HLInstance.VOLUME_EPSILON) {
+					this.volumeLevels.set(keyId, level)
+					volumeChanged = true
+				}
 			}
 		}
 		if (changed) this.publishMuteState()
+		if (volumeChanged) this.publishVolumeState()
 	}
 
 	// Fraction of strongly-red pixels in a box. The mute glyph is bright red on both
@@ -446,6 +474,54 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 			}
 		}
 		return total > 0 ? hits / total : 0
+	}
+
+	// Fill extent of a key's volume bar, as a fraction of the cell width, or undefined
+	// when the key draws no bar (unassigned key). Scans the bar rows for the rightmost
+	// bright pixel: the bar is drawn bright up to the level and dark beyond it.
+	private barFraction(
+		img: jpeg.RawImageData<Uint8Array>,
+		cellX: number,
+		cellY: number,
+		cellW: number,
+		cellH: number,
+	): number | undefined {
+		const y1 = Math.max(0, Math.floor(cellY + cellH * RiedelRSP1232HLInstance.VOLUME_BAR_TOP))
+		const y2 = Math.min(img.height, Math.floor(cellY + cellH * RiedelRSP1232HLInstance.VOLUME_BAR_BOTTOM))
+		// Skip the cell's own border on both sides, which is bright on a selected key.
+		const x1 = Math.max(0, Math.floor(cellX + cellW * 0.05))
+		const x2 = Math.min(img.width, Math.floor(cellX + cellW * 0.97))
+		let rightmost = -1
+		for (let x = x1; x < x2; x++) {
+			for (let y = y1; y < y2; y++) {
+				const o = (y * img.width + x) * 4
+				const mean = (img.data[o] + img.data[o + 1] + img.data[o + 2]) / 3
+				if (mean > RiedelRSP1232HLInstance.VOLUME_BAR_BRIGHT) {
+					rightmost = x
+					break
+				}
+			}
+		}
+		if (rightmost < 0) return undefined
+		return (rightmost - cellX) / cellW
+	}
+
+	private publishVolumeState(): void {
+		const values: CompanionVariableValues = {}
+		const summary: string[] = []
+		for (let keyId = 0; keyId < 32; keyId++) {
+			const level = this.volumeLevels.get(keyId)
+			if (level === undefined) {
+				values[`key_${keyId + 1}_volume`] = ''
+				continue
+			}
+			const percent = Math.round(level * 100)
+			values[`key_${keyId + 1}_volume`] = String(percent)
+			summary.push(`${keyId + 1}:${percent}`)
+		}
+		values.volume_levels = summary.join(',')
+		this.setVariableValues(values)
+		this.checkFeedbacks('keyVolume')
 	}
 
 	private publishMuteState(): void {
@@ -496,9 +572,58 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 				last_button_state: buttonState,
 			})
 			this.checkFeedbacks('keyButtonState')
+		} else if (topic === '/LiveView/LeverKeyRotaryTurned') {
+			const panelId = Number(body.panelId ?? 0)
+			const keyId = Number(body.keyId)
+			const steps = Number(body.stepsTurned ?? 0)
+			if (Number.isNaN(keyId) || steps === 0) return
+			this.setVariableValues({
+				last_rotary_panel: String(panelId),
+				last_rotary_key: String(keyId + 1),
+				last_rotary_steps: String(steps),
+			})
+			this.applyRotaryGang(panelId, keyId, steps)
 		}
 		// Other /live-view topics (e.g. LeverKeyLedRingStateChanged) are high-frequency
 		// ring-colour updates we intentionally ignore.
+	}
+
+	/**
+	 * Ganged volume trim: when the configured source key's encoder is turned, pass the
+	 * same relative step to every target key, so a group of conferences moves together
+	 * and keeps its existing balance.
+	 *
+	 * Sent on the already-open live-view socket rather than a fresh connection - a spin
+	 * emits a burst of detents and a connect per detent would lag badly.
+	 */
+	private applyRotaryGang(panelId: number, keyId: number, steps: number): void {
+		if (this.config.enableRotaryGang !== true) return
+		if (panelId !== Number(this.config.gangSourcePanel ?? 0)) return
+		if (keyId !== Number(this.config.gangSourceKey ?? 1) - 1) return
+
+		const targetPanel = Number(this.config.gangTargetPanel ?? 0)
+		const targets = parseKeySpec(String(this.config.gangTargetKeys ?? ''))
+		if (targets.length === 0) return
+
+		const socket = this.liveViewWs
+		if (!socket || socket.readyState !== WebSocket.OPEN) {
+			this.log('debug', 'Rotary gang: live-view socket not open, dropping step')
+			return
+		}
+		let sent = 0
+		for (const keyNumber of targets) {
+			// Never echo a step back to the source key: the panel would broadcast that
+			// as another LeverKeyRotaryTurned and we would gang off our own output.
+			if (targetPanel === panelId && keyNumber - 1 === keyId) continue
+			socket.send(
+				JSON.stringify({
+					topic: '/LiveView/SimulateLeverKeyRotary',
+					body: { panelId: targetPanel, keyId: keyNumber - 1, stepsTurned: steps },
+				}),
+			)
+			sent++
+		}
+		this.log('debug', `Rotary gang: ${steps > 0 ? '+' : ''}${steps} to ${sent} key(s) on panel ${targetPanel}`)
 	}
 
 	private handleMessage(message: string): void {
@@ -1202,7 +1327,51 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 		})
 	}
 
+	/**
+	 * Nudge the volume of one or more keys by a relative number of detents.
+	 *
+	 * The panel has no absolute "set volume" command - leverKeysRotary.stepsTurned is a
+	 * last-turn delta, not a position - so volume is only ever moved relatively. Sending
+	 * the same step to a set of keys therefore trims them as a group while preserving
+	 * whatever balance they already had.
+	 *
+	 * All the keys go out over a single live-view session, reusing the persistent
+	 * monitoring socket when one is open so a spin does not pay a connect per detent.
+	 */
+	public async adjustKeyVolumes(panelId: number, keyNumbers: number[], steps: number): Promise<void> {
+		if (steps === 0 || keyNumbers.length === 0) return
+		const keyIds = keyNumbers.filter((keyNumber) => keyNumber >= 1).map((keyNumber) => keyNumber - 1)
+		if (keyIds.length === 0) return
+
+		const frames = keyIds.map((keyId) =>
+			JSON.stringify({
+				topic: '/LiveView/SimulateLeverKeyRotary',
+				body: { panelId, keyId, stepsTurned: steps },
+			}),
+		)
+
+		const live = this.liveViewWs
+		if (live && live.readyState === WebSocket.OPEN) {
+			for (const frame of frames) live.send(frame)
+			return
+		}
+
+		const target = this.parseIpAndPort()
+		if (!target || !target.ip) {
+			this.log('warn', 'Adjust Key Volume: no host configured')
+			return
+		}
+		await this.runLiveViewCommand(target.ip, async (socket) => {
+			for (const frame of frames) socket.send(frame)
+		})
+	}
+
 	// Getter methods for feedbacks
+	public getKeyVolume(keyNumber: number): number | undefined {
+		const level = this.volumeLevels.get(keyNumber - 1)
+		return level === undefined ? undefined : Math.round(level * 100)
+	}
+
 	public isConnected(): boolean {
 		return this.ws !== null && this.ws.readyState === WebSocket.OPEN
 	}

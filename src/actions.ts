@@ -1,5 +1,7 @@
 import { Regex, CompanionActionDefinitions } from '@companion-module/base'
 import type { RiedelRSP1232HLInstance } from './main.js'
+import { parseKeySpec } from './keys.js'
+import { PANEL_CHOICES } from './config.js'
 
 export function getActions(instance: RiedelRSP1232HLInstance): CompanionActionDefinitions {
 	return {
@@ -825,29 +827,90 @@ export function getActions(instance: RiedelRSP1232HLInstance): CompanionActionDe
 				instance.log('info', `Clear Mute Snapshot: "${slot}" ${existed ? 'cleared' : 'did not exist'}`)
 			},
 		},
-	}
-}
 
-/**
- * Parse a key spec such as "1-8", "1,3,5" or "1-4,7,9-11" into a sorted, unique
- * list of key numbers clamped to the panel's 1-32 range.
- */
-function parseKeySpec(spec: string): number[] {
-	const out = new Set<number>()
-	for (const part of spec.split(',')) {
-		const token = part.trim()
-		if (!token) continue
-		const range = /^(\d+)\s*-\s*(\d+)$/.exec(token)
-		if (range) {
-			const a = parseInt(range[1], 10)
-			const b = parseInt(range[2], 10)
-			if (!isNaN(a) && !isNaN(b)) {
-				for (let key = Math.min(a, b); key <= Math.max(a, b); key++) out.add(key)
-			}
-		} else {
-			const n = parseInt(token, 10)
-			if (!isNaN(n)) out.add(n)
-		}
+		// Volume (per-key rotary encoder)
+		adjustKeyVolume: {
+			name: 'Adjust Key Volume',
+			description:
+				'Turn a key\'s volume encoder by a number of detents. Positive turns up, negative turns down. Roughly 40 detents covers the full range. Relative only - the panel has no "set volume to X" command.',
+			options: [
+				{
+					type: 'dropdown',
+					label: 'Panel',
+					id: 'panelId',
+					default: 0,
+					choices: PANEL_CHOICES,
+				},
+				{
+					type: 'textinput',
+					label: 'Key Number (1 - 32)',
+					id: 'keyNumber',
+					default: '1',
+					useVariables: true,
+				},
+				{
+					type: 'number',
+					label: 'Steps (negative turns down)',
+					id: 'steps',
+					default: 1,
+					min: -40,
+					max: 40,
+				},
+			],
+			callback: async (action, context) => {
+				const panelId = Number(action.options.panelId ?? 0)
+				const keyNumber = parseInt(await context.parseVariablesInString(String(action.options.keyNumber ?? '1')), 10)
+				const steps = Number(action.options.steps ?? 1)
+				if (isNaN(keyNumber)) {
+					instance.log('warn', 'Adjust Key Volume: invalid key number')
+					return
+				}
+				await instance.adjustKeyVolumes(panelId, [keyNumber], steps)
+			},
+		},
+		adjustKeyVolumeMultiple: {
+			name: 'Adjust Volume on Multiple Keys (ganged trim)',
+			description:
+				'Trim a whole group of keys by the same number of detents in one action, e.g. "1-8". Every key moves together, so the balance between them is preserved. Relative only.',
+			options: [
+				{
+					type: 'dropdown',
+					label: 'Panel',
+					id: 'panelId',
+					default: 0,
+					choices: PANEL_CHOICES,
+				},
+				{
+					type: 'textinput',
+					label: 'Keys (e.g. 1-8 or 1,3,5-7)',
+					id: 'keys',
+					default: '1-8',
+					useVariables: true,
+				},
+				{
+					type: 'number',
+					label: 'Steps (negative turns down)',
+					id: 'steps',
+					default: 1,
+					min: -40,
+					max: 40,
+				},
+			],
+			callback: async (action, context) => {
+				const panelId = Number(action.options.panelId ?? 0)
+				const spec = await context.parseVariablesInString(String(action.options.keys ?? ''))
+				const keys = parseKeySpec(spec)
+				const steps = Number(action.options.steps ?? 1)
+				if (keys.length === 0) {
+					instance.log('warn', `Adjust Volume on Multiple Keys: no valid keys in "${spec}"`)
+					return
+				}
+				await instance.adjustKeyVolumes(panelId, keys, steps)
+				instance.log(
+					'info',
+					`Adjust Volume on Multiple Keys: ${steps > 0 ? '+' : ''}${steps} to key(s) ${keys.join(',')}`,
+				)
+			},
+		},
 	}
-	return [...out].filter((key) => key >= 1 && key <= 32).sort((a, b) => a - b)
 }
