@@ -81,6 +81,8 @@ Because the capture happens first, Restore returns each key to whatever it was *
 
 ### Key-Press Monitoring
 
+Both monitoring features below are **off by default** — tick them per connection only where you need them, so the rest of a fleet is untouched.
+
 Enable **Monitor key presses** in the connection config to have the module open a second, read-only connection to the panel's `/live-view` WebSocket. It surfaces every physical key actuation as variables and feedbacks, so a real panel key press (not a Companion/Stream Deck button) can drive Companion logic — flashes, triggers, batch mutes, etc.
 
 - Two controls per key are reported independently:

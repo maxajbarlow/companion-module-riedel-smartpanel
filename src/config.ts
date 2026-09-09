@@ -50,20 +50,23 @@ export function getConfigFields(): SomeCompanionConfigField[] {
 			max: 65535,
 			isVisible: (options) => !options['bonjourHost'],
 		},
+		// Both monitoring features are opt-in: they open a second connection to the
+		// panel and (for mute state) decode display images, so they stay off unless
+		// asked for. This also means upgrading an existing connection changes nothing.
 		{
 			type: 'checkbox',
 			id: 'enableKeyEvents',
 			label: 'Monitor key presses (opens a second /live-view connection)',
 			width: 12,
-			default: true,
+			default: false,
 		},
 		{
 			type: 'checkbox',
 			id: 'enableMuteState',
 			label: 'Monitor mute state (decodes the key displays; needed for Set Key Mute)',
 			width: 12,
-			default: true,
-			isVisible: (options) => options['enableKeyEvents'] !== false,
+			default: false,
+			isVisible: (options) => options['enableKeyEvents'] === true,
 		},
 	]
 }

@@ -284,7 +284,10 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 	// notifications. It is independent of the main /websocket status link and only
 	// logs at debug level so a flaky live-view socket never masks the real status.
 	private initLiveView(): void {
-		if (this.config.enableKeyEvents === false) {
+		// Opt-in: anything other than an explicit true (including a connection
+		// upgraded from an older version, which has no such setting saved) leaves
+		// the panel completely untouched.
+		if (this.config.enableKeyEvents !== true) {
 			this.closeLiveView()
 			return
 		}
@@ -311,7 +314,7 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 				// Subscribing makes the panel push key events *and* an updated display
 				// image whenever a key's rendering changes (including mute).
 				this.sendLiveView('/LiveView/SubscribePanelEvents', { panelId: 0 })
-				if (this.config.enableMuteState !== false) {
+				if (this.config.enableMuteState === true) {
 					// One-shot snapshot so mute state is known before anything changes.
 					this.sendLiveView('/LiveView/RequestDisplayContent', { panelId: 0 })
 				}
@@ -327,7 +330,7 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 				// Display content arrives as binary frames; everything else is JSON text.
 				// 0x7b === '{' guards the case where isBinary is not supplied.
 				if (isBinary || (buf.length > 4 && buf[0] !== 0x7b)) {
-					if (this.config.enableMuteState !== false) {
+					if (this.config.enableMuteState === true) {
 						this.handleDisplayFrame(buf)
 					}
 					return
@@ -342,7 +345,7 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 					this.log('debug', 'LiveView (key events) disconnected')
 				}
 				this.liveViewWasConnected = false
-				if (this.config.enableKeyEvents !== false && !this.liveViewReconnectTimer) {
+				if (this.config.enableKeyEvents === true && !this.liveViewReconnectTimer) {
 					this.liveViewReconnectTimer = setTimeout(() => {
 						this.liveViewReconnectTimer = null
 						this.initLiveView()
