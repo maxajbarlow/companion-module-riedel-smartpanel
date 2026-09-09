@@ -121,8 +121,24 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 	private muteSnapshots: Map<string, Map<number, boolean>> = new Map()
 	private lastSnapshotSlot = ''
 
+	// Last values actually pushed to Companion, so we only send what changed.
+	// Every variable write crosses the IPC boundary into the shared Companion
+	// process; a fleet of panels all re-sending 64 unchanged values on every
+	// display frame adds up there, even though each module runs in its own process.
+	private publishedMute: Map<number, string> = new Map()
+	private publishedVolume: Map<number, string> = new Map()
+
 	constructor(internal: unknown) {
 		super(internal)
+	}
+
+	/**
+	 * Reconnect delay with jitter. Without it a switch reboot drops every panel at
+	 * once and they all retry in lockstep forever, hammering the network and each
+	 * panel in synchronised waves - the more panels, the worse it gets.
+	 */
+	private reconnectDelay(): number {
+		return 5000 + Math.floor(Math.random() * 2500)
 	}
 
 	async init(config: DeviceConfig): Promise<void> {
@@ -284,8 +300,9 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 				this.checkFeedbacks('connectionStatus')
 				if (!this.reconnectTimer) {
 					this.reconnectTimer = setTimeout(() => {
+						this.reconnectTimer = null
 						this.initWebSocket()
-					}, 5000)
+					}, this.reconnectDelay())
 				}
 			})
 		} catch (error) {
@@ -363,7 +380,7 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 					this.liveViewReconnectTimer = setTimeout(() => {
 						this.liveViewReconnectTimer = null
 						this.initLiveView()
-					}, 5000)
+					}, this.reconnectDelay())
 				}
 			})
 		} catch (error) {
@@ -511,13 +528,12 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 		const summary: string[] = []
 		for (let keyId = 0; keyId < 32; keyId++) {
 			const level = this.volumeLevels.get(keyId)
-			if (level === undefined) {
-				values[`key_${keyId + 1}_volume`] = ''
-				continue
+			const text = level === undefined ? '' : String(Math.round(level * 100))
+			if (this.publishedVolume.get(keyId) !== text) {
+				values[`key_${keyId + 1}_volume`] = text
+				this.publishedVolume.set(keyId, text)
 			}
-			const percent = Math.round(level * 100)
-			values[`key_${keyId + 1}_volume`] = String(percent)
-			summary.push(`${keyId + 1}:${percent}`)
+			if (text !== '') summary.push(`${keyId + 1}:${text}`)
 		}
 		values.volume_levels = summary.join(',')
 		this.setVariableValues(values)
@@ -529,7 +545,11 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 		const mutedList: number[] = []
 		for (let keyId = 0; keyId < 32; keyId++) {
 			const muted = this.mutedKeys.get(keyId)
-			values[`key_${keyId + 1}_muted`] = muted === undefined ? '' : muted ? 'true' : 'false'
+			const text = muted === undefined ? '' : muted ? 'true' : 'false'
+			if (this.publishedMute.get(keyId) !== text) {
+				values[`key_${keyId + 1}_muted`] = text
+				this.publishedMute.set(keyId, text)
+			}
 			if (muted) mutedList.push(keyId + 1)
 		}
 		values.muted_keys = mutedList.join(',')
