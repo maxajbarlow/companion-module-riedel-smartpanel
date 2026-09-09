@@ -4,6 +4,8 @@ export interface DeviceConfig {
 	bonjourHost?: string
 	host?: string
 	port?: number
+	enableKeyEvents?: boolean
+	enableMuteState?: boolean
 }
 
 export function getConfigFields(): SomeCompanionConfigField[] {
@@ -47,6 +49,21 @@ export function getConfigFields(): SomeCompanionConfigField[] {
 			min: 1,
 			max: 65535,
 			isVisible: (options) => !options['bonjourHost'],
+		},
+		{
+			type: 'checkbox',
+			id: 'enableKeyEvents',
+			label: 'Monitor key presses (opens a second /live-view connection)',
+			width: 12,
+			default: true,
+		},
+		{
+			type: 'checkbox',
+			id: 'enableMuteState',
+			label: 'Monitor mute state (decodes the key displays; needed for Set Key Mute)',
+			width: 12,
+			default: true,
+			isVisible: (options) => options['enableKeyEvents'] !== false,
 		},
 	]
 }

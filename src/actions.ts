@@ -580,5 +580,152 @@ export function getActions(instance: RiedelRSP1232HLInstance): CompanionActionDe
 				await instance.toggleKeyMuteAtIp(ip, panelId, keyNumber, durationMs)
 			},
 		},
+		setKeyMute: {
+			name: 'Set Key Mute (state-aware)',
+			description:
+				'Set a key muted or unmuted. Reads the real mute state from the panel and only actuates when it differs, so repeated presses are safe. Requires "Monitor mute state". Master panel.',
+			options: [
+				{
+					type: 'textinput',
+					label: 'Key Number (1 - 32)',
+					id: 'keyNumber',
+					default: '1',
+					useVariables: true,
+				},
+				{
+					type: 'dropdown',
+					label: 'Set to',
+					id: 'state',
+					default: 'on',
+					choices: [
+						{ id: 'on', label: 'Muted' },
+						{ id: 'off', label: 'Unmuted' },
+						{ id: 'toggle', label: 'Toggle (always actuate)' },
+					],
+				},
+				{
+					type: 'number',
+					label: 'Press Hold Duration (ms)',
+					id: 'durationMs',
+					default: 250,
+					min: 200,
+					max: 2000,
+				},
+			],
+			callback: async (action, context) => {
+				const parsed = await context.parseVariablesInString(String(action.options.keyNumber ?? '1'))
+				const keyNumber = parseInt(parsed, 10) || 1
+				const durationMs = Number(action.options.durationMs ?? 250)
+				const want = String(action.options.state ?? 'on')
+				if (want === 'toggle') {
+					await instance.toggleKeyMute(0, keyNumber, durationMs)
+					return
+				}
+				const desired = want === 'on'
+				const current = instance.getKeyMuted(keyNumber)
+				if (current === undefined) {
+					instance.log(
+						'warn',
+						`Set Key Mute: mute state for key ${keyNumber} is unknown - enable "Monitor mute state" and make sure the key is on the displayed shift page. Not actuating.`,
+					)
+					return
+				}
+				if (current === desired) {
+					instance.log('debug', `Set Key Mute: key ${keyNumber} already ${desired ? 'muted' : 'unmuted'}`)
+					return
+				}
+				await instance.toggleKeyMute(0, keyNumber, durationMs)
+			},
+		},
+		setKeyMuteMultiple: {
+			name: 'Set Mute on Multiple Keys (state-aware)',
+			description:
+				'Mute or unmute a set of keys in one action, e.g. "1-8" or "1,3,5-7". Only keys whose state differs are actuated, so this is safe to repeat - ideal for a focus-mute shortcut. Requires "Monitor mute state". Master panel.',
+			options: [
+				{
+					type: 'textinput',
+					label: 'Keys (e.g. 1-8 or 1,3,5-7)',
+					id: 'keys',
+					default: '1-8',
+					useVariables: true,
+				},
+				{
+					type: 'dropdown',
+					label: 'Set to',
+					id: 'state',
+					default: 'on',
+					choices: [
+						{ id: 'on', label: 'Muted' },
+						{ id: 'off', label: 'Unmuted' },
+					],
+				},
+				{
+					type: 'number',
+					label: 'Press Hold Duration (ms)',
+					id: 'durationMs',
+					default: 250,
+					min: 200,
+					max: 2000,
+				},
+			],
+			callback: async (action, context) => {
+				const spec = await context.parseVariablesInString(String(action.options.keys ?? ''))
+				const keys = parseKeySpec(spec)
+				if (keys.length === 0) {
+					instance.log('warn', `Set Mute on Multiple Keys: no valid keys in "${spec}"`)
+					return
+				}
+				const desired = String(action.options.state ?? 'on') === 'on'
+				const durationMs = Number(action.options.durationMs ?? 250)
+				const changed: number[] = []
+				const unknown: number[] = []
+				for (const key of keys) {
+					const current = instance.getKeyMuted(key)
+					if (current === undefined) {
+						unknown.push(key)
+						continue
+					}
+					if (current === desired) continue
+					await instance.toggleKeyMute(0, key, durationMs)
+					changed.push(key)
+				}
+				if (unknown.length > 0) {
+					instance.log(
+						'warn',
+						`Set Mute on Multiple Keys: state unknown for key(s) ${unknown.join(',')} - not actuated (enable "Monitor mute state").`,
+					)
+				}
+				instance.log(
+					'info',
+					`Set Mute on Multiple Keys: ${desired ? 'muted' : 'unmuted'} ${
+						changed.length > 0 ? changed.join(',') : 'nothing (already in the requested state)'
+					}`,
+				)
+			},
+		},
 	}
+}
+
+/**
+ * Parse a key spec such as "1-8", "1,3,5" or "1-4,7,9-11" into a sorted, unique
+ * list of key numbers clamped to the panel's 1-32 range.
+ */
+function parseKeySpec(spec: string): number[] {
+	const out = new Set<number>()
+	for (const part of spec.split(',')) {
+		const token = part.trim()
+		if (!token) continue
+		const range = /^(\d+)\s*-\s*(\d+)$/.exec(token)
+		if (range) {
+			const a = parseInt(range[1], 10)
+			const b = parseInt(range[2], 10)
+			if (!isNaN(a) && !isNaN(b)) {
+				for (let key = Math.min(a, b); key <= Math.max(a, b); key++) out.add(key)
+			}
+		} else {
+			const n = parseInt(token, 10)
+			if (!isNaN(n)) out.add(n)
+		}
+	}
+	return [...out].filter((key) => key >= 1 && key <= 32).sort((a, b) => a - b)
 }

@@ -559,5 +559,138 @@ export function getFeedbacks(instance: RiedelRSP1232HLInstance): CompanionFeedba
 				return feedback.options.state === 'enabled' ? enabled : !enabled
 			},
 		},
+		// Key-press monitoring (requires "Monitor key presses" enabled in config).
+		keyLeverState: {
+			type: 'boolean',
+			name: 'Key Lever State',
+			description: "True while a key's lever is in the selected position (from the live-view key monitor)",
+			defaultStyle: {
+				color: 0xffffff,
+				bgcolor: 0xff0000,
+			},
+			options: [
+				{
+					type: 'dropdown',
+					label: 'Panel',
+					id: 'panelId',
+					default: 0,
+					choices: [
+						{ id: 0, label: 'Master Panel (Panel 0)' },
+						{ id: 1, label: 'Expansion Panel 1 (Panel 1)' },
+						{ id: 2, label: 'Expansion Panel 2 (Panel 2)' },
+						{ id: 3, label: 'Expansion Panel 3 (Panel 3)' },
+						{ id: 4, label: 'Expansion Panel 4 (Panel 4)' },
+					],
+				},
+				{
+					type: 'number',
+					label: 'Key Number (1 - 32)',
+					id: 'keyNumber',
+					default: 1,
+					min: 1,
+					max: 32,
+				},
+				{
+					type: 'dropdown',
+					label: 'Lever State',
+					id: 'state',
+					default: 'Up',
+					choices: [
+						{ id: 'Up', label: 'Up' },
+						{ id: 'Down', label: 'Down' },
+						{ id: 'Released', label: 'Released (centre)' },
+					],
+				},
+			],
+			callback: (feedback) => {
+				const panelId = Number(feedback.options.panelId ?? 0)
+				const keyNumber = Number(feedback.options.keyNumber ?? 1)
+				return instance.getLeverState(panelId, keyNumber) === feedback.options.state
+			},
+		},
+		keyButtonState: {
+			type: 'boolean',
+			name: 'Key Button State',
+			description:
+				"True while a key's encoder button (rotary push) is in the selected state (from the live-view key monitor)",
+			defaultStyle: {
+				color: 0xffffff,
+				bgcolor: 0xff0000,
+			},
+			options: [
+				{
+					type: 'dropdown',
+					label: 'Panel',
+					id: 'panelId',
+					default: 0,
+					choices: [
+						{ id: 0, label: 'Master Panel (Panel 0)' },
+						{ id: 1, label: 'Expansion Panel 1 (Panel 1)' },
+						{ id: 2, label: 'Expansion Panel 2 (Panel 2)' },
+						{ id: 3, label: 'Expansion Panel 3 (Panel 3)' },
+						{ id: 4, label: 'Expansion Panel 4 (Panel 4)' },
+					],
+				},
+				{
+					type: 'number',
+					label: 'Key Number (1 - 32)',
+					id: 'keyNumber',
+					default: 1,
+					min: 1,
+					max: 32,
+				},
+				{
+					type: 'dropdown',
+					label: 'Button State',
+					id: 'state',
+					default: 'Pressed',
+					choices: [
+						{ id: 'Pressed', label: 'Pressed' },
+						{ id: 'Released', label: 'Released' },
+					],
+				},
+			],
+			callback: (feedback) => {
+				const panelId = Number(feedback.options.panelId ?? 0)
+				const keyNumber = Number(feedback.options.keyNumber ?? 1)
+				return instance.getButtonState(panelId, keyNumber) === feedback.options.state
+			},
+		},
+		keyMuted: {
+			type: 'boolean',
+			name: 'Key Muted',
+			description:
+				'True when a key is muted. Decoded from the rendered key display, so it reflects real panel state. Requires "Monitor mute state"; master panel, currently displayed shift page.',
+			defaultStyle: {
+				color: 0xffffff,
+				bgcolor: 0xff0000,
+			},
+			options: [
+				{
+					type: 'number',
+					label: 'Key Number (1 - 32)',
+					id: 'keyNumber',
+					default: 1,
+					min: 1,
+					max: 32,
+				},
+				{
+					type: 'dropdown',
+					label: 'Show when',
+					id: 'state',
+					default: 'muted',
+					choices: [
+						{ id: 'muted', label: 'Muted' },
+						{ id: 'unmuted', label: 'Unmuted' },
+					],
+				},
+			],
+			callback: (feedback) => {
+				const keyNumber = Number(feedback.options.keyNumber ?? 1)
+				const muted = instance.getKeyMuted(keyNumber)
+				if (muted === undefined) return false // state not known yet
+				return feedback.options.state === 'muted' ? muted : !muted
+			},
+		},
 	}
 }
