@@ -1147,41 +1147,58 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 	}
 
 	public async toggleKeyMute(panelId: number, keyNumber: number, durationMs = 250): Promise<void> {
+		await this.toggleKeyMutes(panelId, [keyNumber], durationMs)
+	}
+
+	public async toggleKeyMutes(panelId: number, keyNumbers: number[], durationMs = 250): Promise<void> {
 		const target = this.parseIpAndPort()
 		if (!target || !target.ip) {
 			this.log('warn', 'Toggle Key Mute: no host configured')
 			return
 		}
-		await this.toggleKeyMuteAtIp(target.ip, panelId, keyNumber, durationMs)
+		await this.toggleKeyMutesAtIp(target.ip, panelId, keyNumbers, durationMs)
 	}
 
 	public async toggleKeyMuteAtIp(host: string, panelId: number, keyNumber: number, durationMs = 250): Promise<void> {
-		if (keyNumber < 1) {
-			this.log('warn', `Invalid key number: ${keyNumber}. Must be >= 1`)
-			return
+		await this.toggleKeyMutesAtIp(host, panelId, [keyNumber], durationMs)
+	}
+
+	/**
+	 * Toggle a set of keys in ONE live-view session: all keys are pressed together,
+	 * held once, then released together. Toggling them one at a time instead would
+	 * open a socket and serve a full hold per key, which makes a batch of eight take
+	 * several seconds and visibly cascade down the panel.
+	 */
+	public async toggleKeyMutesAtIp(
+		host: string,
+		panelId: number,
+		keyNumbers: number[],
+		durationMs = 250,
+	): Promise<void> {
+		const keyIds: number[] = []
+		for (const keyNumber of keyNumbers) {
+			if (keyNumber < 1) {
+				this.log('warn', `Invalid key number: ${keyNumber}. Must be >= 1`)
+				continue
+			}
+			keyIds.push(keyNumber - 1)
 		}
-		const keyId = keyNumber - 1
+		if (keyIds.length === 0) return
+
 		await this.runLiveViewCommand(host, async (socket) => {
-			const sendMsg = (topic: string, body: Record<string, unknown>) => {
-				socket.send(JSON.stringify({ topic, body }))
+			// One JSON message per frame - the panel rejects arrays and newline-separated batches.
+			const sendAll = (buttonState: 'Pressed' | 'Released') => {
+				for (const keyId of keyIds) {
+					socket.send(JSON.stringify({ topic: '/LiveView/SimulateButton', body: { panelId, keyId, buttonState } }))
+				}
 			}
 
-			// Press
-			sendMsg('/LiveView/SimulateButton', {
-				panelId,
-				keyId,
-				buttonState: 'Pressed',
-			})
+			sendAll('Pressed')
 
-			// Hold duration (minimum 200ms required by panel firmware)
+			// Hold duration (minimum 200ms required by panel firmware), served once for the whole batch
 			await new Promise((resolve) => setTimeout(resolve, Math.max(durationMs, 200)))
 
-			// Release
-			sendMsg('/LiveView/SimulateButton', {
-				panelId,
-				keyId,
-				buttonState: 'Released',
-			})
+			sendAll('Released')
 		})
 	}
 

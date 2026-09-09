@@ -677,6 +677,8 @@ export function getActions(instance: RiedelRSP1232HLInstance): CompanionActionDe
 				}
 				const desired = String(action.options.state ?? 'on') === 'on'
 				const durationMs = Number(action.options.durationMs ?? 250)
+				// Work out the whole set first, then actuate it in a single batch so the
+				// keys change together instead of cascading one at a time.
 				const changed: number[] = []
 				const unknown: number[] = []
 				for (const key of keys) {
@@ -686,8 +688,10 @@ export function getActions(instance: RiedelRSP1232HLInstance): CompanionActionDe
 						continue
 					}
 					if (current === desired) continue
-					await instance.toggleKeyMute(0, key, durationMs)
 					changed.push(key)
+				}
+				if (changed.length > 0) {
+					await instance.toggleKeyMutes(0, changed, durationMs)
 				}
 				if (unknown.length > 0) {
 					instance.log(
@@ -775,6 +779,8 @@ export function getActions(instance: RiedelRSP1232HLInstance): CompanionActionDe
 					instance.log('warn', `Restore Mute State: no snapshot named "${slot}" - capture one first.`)
 					return
 				}
+				// Collect every key that drifted from the snapshot, then put them all back
+				// in one batch so an undo lands at once rather than key by key.
 				const restored: number[] = []
 				const unknown: number[] = []
 				for (const [keyNumber, wasMuted] of snapshot) {
@@ -784,8 +790,10 @@ export function getActions(instance: RiedelRSP1232HLInstance): CompanionActionDe
 						continue
 					}
 					if (current === wasMuted) continue
-					await instance.toggleKeyMute(0, keyNumber, durationMs)
 					restored.push(keyNumber)
+				}
+				if (restored.length > 0) {
+					await instance.toggleKeyMutes(0, restored, durationMs)
 				}
 				if (unknown.length > 0) {
 					instance.log('warn', `Restore Mute State: state unknown for key(s) ${unknown.join(',')} - not restored.`)

@@ -62,6 +62,8 @@ This module requires the panel to be running firmware version 2.0.0 or later. Ea
 
 > **Why state-aware matters:** _Toggle Mute on Key_ fires blind — if a key is already muted, a toggle **unmutes** it. The state-aware actions read the panel first, so "mute these 8" always ends with those 8 muted regardless of where they started.
 
+> **The batch actions act on every key at once.** _Set Mute on Multiple Keys_ and _Restore Mute State_ press all the keys they need to change together, hold once, then release together — so a set of eight lands in one go rather than rippling across the panel. Stacking eight individual _Set Key Mute_ actions on a button behaves the same way, but the batch action does it over a single connection.
+
 ### Capture & Restore (undo)
 
 - **Capture Mute State (snapshot)**: Records which keys are currently muted under a snapshot name. Leave _Keys_ empty to capture every key whose state is known, or scope it (`1-8`).

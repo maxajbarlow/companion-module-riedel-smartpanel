@@ -5,3 +5,4 @@ tmpclaude-*
 package-lock.json
 /dist
 *.tgz
+/pkg
