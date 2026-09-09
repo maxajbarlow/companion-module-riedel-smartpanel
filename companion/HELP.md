@@ -62,6 +62,23 @@ This module requires the panel to be running firmware version 2.0.0 or later. Ea
 
 > **Why state-aware matters:** _Toggle Mute on Key_ fires blind — if a key is already muted, a toggle **unmutes** it. The state-aware actions read the panel first, so "mute these 8" always ends with those 8 muted regardless of where they started.
 
+### Capture & Restore (undo)
+
+- **Capture Mute State (snapshot)**: Records which keys are currently muted under a snapshot name. Leave _Keys_ empty to capture every key whose state is known, or scope it (`1-8`).
+- **Restore Mute State (undo)**: Puts every key in the snapshot back to the state it had when captured. Only keys that have since changed are actuated, so pressing it twice is harmless.
+- **Clear Mute Snapshot**: Discards a snapshot.
+
+A typical "focus" button pair:
+
+| Button      | Actions                                                                                   |
+| ----------- | ----------------------------------------------------------------------------------------- |
+| **Focus**   | _Capture Mute State_ (`default`, keys `1-8`) → _Set Mute on Multiple Keys_ (`1-8`, Muted) |
+| **Restore** | _Restore Mute State_ (`default`)                                                          |
+
+Because the capture happens first, Restore returns each key to whatever it was **before** you focused — not blanket-unmuted. Add the **Mute Snapshot Differs** feedback to the Restore button so it only lights up when there is actually something to undo.
+
+> Snapshots are held **in memory** — they are a within-session undo point and do not survive a Companion restart or a connection reload. Capturing again under the same name overwrites it.
+
 ### Key-Press Monitoring
 
 Enable **Monitor key presses** in the connection config to have the module open a second, read-only connection to the panel's `/live-view` WebSocket. It surfaces every physical key actuation as variables and feedbacks, so a real panel key press (not a Companion/Stream Deck button) can drive Companion logic — flashes, triggers, batch mutes, etc.
@@ -102,6 +119,7 @@ The panel exposes **no mute field** anywhere in its API — but it _renders_ a r
 - **Key Lever State**: True while a monitored key's lever is in the selected position (Up/Down/Released) — requires _Monitor key presses_
 - **Key Button State**: True while a monitored key's encoder button is Pressed/Released — requires _Monitor key presses_
 - **Key Muted**: True when a key is actually muted (decoded from the key display) — requires _Monitor mute state_
+- **Mute Snapshot Differs (restore available)**: True when a snapshot exists and the panel has changed since — light a Restore/Undo button only when there's something to undo
 
 ## Presets
 
@@ -159,6 +177,10 @@ The panel exposes **no mute field** anywhere in its API — but it _renders_ a r
 | `key_1_muted` … `key_32_muted` | Per-key mute state: `true` / `false` (empty if not known)           |
 | `muted_keys`                   | Comma-separated list of currently muted key numbers                 |
 | `muted_count`                  | How many keys are currently muted                                   |
+| `mute_snapshot_slots`          | Names of the stored mute snapshots                                  |
+| `mute_snapshot_last`           | Name of the most recently captured snapshot                         |
+| `mute_snapshot_last_muted`     | Keys that were muted in that snapshot                               |
+| `mute_snapshot_last_size`      | How many keys that snapshot covers                                  |
 
 ## Network Interfaces
 

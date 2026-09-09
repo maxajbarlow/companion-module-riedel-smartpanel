@@ -100,6 +100,13 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 	private static readonly MUTE_GRID_ROWS = 2
 	private static readonly MUTE_RED_THRESHOLD = 0.02
 
+	// Saved mute snapshots, so a "capture now / restore later" undo is possible.
+	// slot name -> (1-based keyNumber -> was muted). Held in memory only: a snapshot
+	// is a within-session undo point and is intentionally not persisted across a
+	// Companion restart.
+	private muteSnapshots: Map<string, Map<number, boolean>> = new Map()
+	private lastSnapshotSlot = ''
+
 	constructor(internal: unknown) {
 		super(internal)
 	}
@@ -449,7 +456,8 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 		values.muted_keys = mutedList.join(',')
 		values.muted_count = String(mutedList.length)
 		this.setVariableValues(values)
-		this.checkFeedbacks('keyMuted')
+		// A restore button's "differs from snapshot" styling depends on live mute state.
+		this.checkFeedbacks('keyMuted', 'muteSnapshotDiffers')
 	}
 
 	private handleLiveViewMessage(message: string): void {
@@ -1231,6 +1239,80 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 	 */
 	public getKeyMuted(keyNumber: number): boolean | undefined {
 		return this.mutedKeys.get(keyNumber - 1)
+	}
+
+	/**
+	 * Snapshot the current mute state so it can be restored later.
+	 * Pass a list of 1-based key numbers, or null for every key whose state is known.
+	 * Keys with unknown state cannot be captured and are reported back to the caller.
+	 */
+	public captureMuteSnapshot(slot: string, keys: number[] | null): { captured: number[]; unknown: number[] } {
+		const candidates = keys && keys.length > 0 ? keys : Array.from({ length: 32 }, (_, i) => i + 1)
+		const snapshot = new Map<number, boolean>()
+		const captured: number[] = []
+		const unknown: number[] = []
+		for (const keyNumber of candidates) {
+			const muted = this.mutedKeys.get(keyNumber - 1)
+			if (muted === undefined) {
+				unknown.push(keyNumber)
+				continue
+			}
+			snapshot.set(keyNumber, muted)
+			captured.push(keyNumber)
+		}
+		if (snapshot.size > 0) {
+			this.muteSnapshots.set(slot, snapshot)
+			this.lastSnapshotSlot = slot
+			this.publishSnapshotState()
+			this.checkFeedbacks('muteSnapshotDiffers')
+		}
+		return { captured, unknown }
+	}
+
+	/** The stored snapshot for a slot: 1-based keyNumber -> was muted. */
+	public getMuteSnapshot(slot: string): Map<number, boolean> | undefined {
+		return this.muteSnapshots.get(slot)
+	}
+
+	public clearMuteSnapshot(slot: string): boolean {
+		const existed = this.muteSnapshots.delete(slot)
+		if (existed) {
+			if (this.lastSnapshotSlot === slot) this.lastSnapshotSlot = ''
+			this.publishSnapshotState()
+			this.checkFeedbacks('muteSnapshotDiffers')
+		}
+		return existed
+	}
+
+	/**
+	 * True when a snapshot exists and at least one of its keys is currently in a
+	 * different state - i.e. restoring it would actually change something. Lets a
+	 * restore button light up only when there is something to undo.
+	 */
+	public muteSnapshotDiffers(slot: string): boolean {
+		const snapshot = this.muteSnapshots.get(slot)
+		if (!snapshot) return false
+		for (const [keyNumber, wasMuted] of snapshot) {
+			const current = this.mutedKeys.get(keyNumber - 1)
+			if (current !== undefined && current !== wasMuted) return true
+		}
+		return false
+	}
+
+	private publishSnapshotState(): void {
+		const last = this.muteSnapshots.get(this.lastSnapshotSlot)
+		const lastMuted = last
+			? [...last.entries()]
+					.filter(([, muted]) => muted)
+					.map(([keyNumber]) => keyNumber)
+					.sort((a, b) => a - b)
+			: []
+		this.setVariableValues({
+			mute_snapshot_slots: [...this.muteSnapshots.keys()].join(','),
+			mute_snapshot_last: this.lastSnapshotSlot,
+			mute_snapshot_last_muted: lastMuted.join(','),
+			mute_snapshot_last_size: String(last ? last.size : 0),
+		})
 	}
 }
 

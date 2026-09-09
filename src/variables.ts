@@ -183,6 +183,22 @@ export function getVariableDefinitions(): CompanionVariableDefinition[] {
 			name: 'Muted Key Count',
 			variableId: 'muted_count',
 		},
+		{
+			name: 'Mute Snapshot: stored slot names',
+			variableId: 'mute_snapshot_slots',
+		},
+		{
+			name: 'Mute Snapshot: most recently captured slot',
+			variableId: 'mute_snapshot_last',
+		},
+		{
+			name: 'Mute Snapshot: keys that were muted in that snapshot',
+			variableId: 'mute_snapshot_last_muted',
+		},
+		{
+			name: 'Mute Snapshot: number of keys captured',
+			variableId: 'mute_snapshot_last_size',
+		},
 	]
 	// Per-key mute state on the master panel, decoded from the rendered key displays.
 	// Empty string until the state is known (monitoring off, or key not on the
@@ -241,6 +257,10 @@ export function getDefaultVariableValues(): CompanionVariableValues {
 		last_button_panel: '',
 		muted_keys: '',
 		muted_count: '0',
+		mute_snapshot_slots: '',
+		mute_snapshot_last: '',
+		mute_snapshot_last_muted: '',
+		mute_snapshot_last_size: '0',
 	}
 	for (let key = 1; key <= 32; key++) {
 		values[`key_${key}_muted`] = ''

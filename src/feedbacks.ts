@@ -692,5 +692,28 @@ export function getFeedbacks(instance: RiedelRSP1232HLInstance): CompanionFeedba
 				return feedback.options.state === 'muted' ? muted : !muted
 			},
 		},
+		muteSnapshotDiffers: {
+			type: 'boolean',
+			name: 'Mute Snapshot Differs (restore available)',
+			description:
+				'True when a mute snapshot exists and the panel has since changed, so restoring it would actually do something. Use it to light a Restore/Undo button only when there is something to undo.',
+			defaultStyle: {
+				color: 0x000000,
+				bgcolor: 0xffff00,
+			},
+			options: [
+				{
+					type: 'textinput',
+					label: 'Snapshot name',
+					id: 'slot',
+					default: 'default',
+					useVariables: true,
+				},
+			],
+			callback: async (feedback, context) => {
+				const slot = (await context.parseVariablesInString(String(feedback.options.slot ?? 'default'))).trim()
+				return instance.muteSnapshotDiffers(slot || 'default')
+			},
+		},
 	}
 }

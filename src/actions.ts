@@ -703,6 +703,120 @@ export function getActions(instance: RiedelRSP1232HLInstance): CompanionActionDe
 				)
 			},
 		},
+		captureMuteState: {
+			name: 'Capture Mute State (snapshot)',
+			description:
+				'Record which keys are currently muted so you can put them back later with Restore Mute State. Leave Keys empty to capture every key whose state is known. Requires "Monitor mute state".',
+			options: [
+				{
+					type: 'textinput',
+					label: 'Snapshot name',
+					id: 'slot',
+					default: 'default',
+					useVariables: true,
+				},
+				{
+					type: 'textinput',
+					label: 'Keys to capture (empty = all, or e.g. 1-8)',
+					id: 'keys',
+					default: '',
+					useVariables: true,
+				},
+			],
+			callback: async (action, context) => {
+				const slot =
+					(await context.parseVariablesInString(String(action.options.slot ?? 'default'))).trim() || 'default'
+				const spec = await context.parseVariablesInString(String(action.options.keys ?? ''))
+				const keys = spec.trim() ? parseKeySpec(spec) : null
+				const { captured, unknown } = instance.captureMuteSnapshot(slot, keys)
+				if (captured.length === 0) {
+					instance.log(
+						'warn',
+						`Capture Mute State: nothing captured for "${slot}" - no key states are known yet. Enable "Monitor mute state" and check the keys are on the displayed shift page.`,
+					)
+					return
+				}
+				if (unknown.length > 0) {
+					instance.log(
+						'warn',
+						`Capture Mute State: state unknown for key(s) ${unknown.join(',')} - not included in snapshot "${slot}".`,
+					)
+				}
+				instance.log('info', `Capture Mute State: snapshot "${slot}" holds ${captured.length} key(s)`)
+			},
+		},
+		restoreMuteState: {
+			name: 'Restore Mute State (undo)',
+			description:
+				'Put every key in a snapshot back to the state it had when captured. Only keys that have since changed are actuated, so this is safe to press twice. Requires "Monitor mute state".',
+			options: [
+				{
+					type: 'textinput',
+					label: 'Snapshot name',
+					id: 'slot',
+					default: 'default',
+					useVariables: true,
+				},
+				{
+					type: 'number',
+					label: 'Press Hold Duration (ms)',
+					id: 'durationMs',
+					default: 250,
+					min: 200,
+					max: 2000,
+				},
+			],
+			callback: async (action, context) => {
+				const slot =
+					(await context.parseVariablesInString(String(action.options.slot ?? 'default'))).trim() || 'default'
+				const durationMs = Number(action.options.durationMs ?? 250)
+				const snapshot = instance.getMuteSnapshot(slot)
+				if (!snapshot) {
+					instance.log('warn', `Restore Mute State: no snapshot named "${slot}" - capture one first.`)
+					return
+				}
+				const restored: number[] = []
+				const unknown: number[] = []
+				for (const [keyNumber, wasMuted] of snapshot) {
+					const current = instance.getKeyMuted(keyNumber)
+					if (current === undefined) {
+						unknown.push(keyNumber)
+						continue
+					}
+					if (current === wasMuted) continue
+					await instance.toggleKeyMute(0, keyNumber, durationMs)
+					restored.push(keyNumber)
+				}
+				if (unknown.length > 0) {
+					instance.log('warn', `Restore Mute State: state unknown for key(s) ${unknown.join(',')} - not restored.`)
+				}
+				instance.log(
+					'info',
+					`Restore Mute State "${slot}": restored ${
+						restored.length > 0 ? restored.join(',') : 'nothing (already matches the snapshot)'
+					}`,
+				)
+			},
+		},
+		clearMuteSnapshot: {
+			name: 'Clear Mute Snapshot',
+			description: 'Discard a stored mute snapshot.',
+			options: [
+				{
+					type: 'textinput',
+					label: 'Snapshot name',
+					id: 'slot',
+					default: 'default',
+					useVariables: true,
+				},
+			],
+			callback: async (action, context) => {
+				const slot =
+					(await context.parseVariablesInString(String(action.options.slot ?? 'default'))).trim() || 'default'
+				const existed = instance.clearMuteSnapshot(slot)
+				instance.log('info', `Clear Mute Snapshot: "${slot}" ${existed ? 'cleared' : 'did not exist'}`)
+			},
+		},
 	}
 }
 
