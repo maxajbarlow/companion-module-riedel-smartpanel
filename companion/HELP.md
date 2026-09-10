@@ -81,6 +81,32 @@ A typical "focus" button pair:
 
 Because the capture happens first, Restore returns each key to whatever it was **before** you focused — not blanket-unmuted. Add the **Mute Snapshot Differs** feedback to the Restore button so it only lights up when there is actually something to undo.
 
+### Muting a key on a page the panel is NOT showing (via Artist/RRCS)
+
+Everything above works on the **currently displayed shift page** only, because it reads and drives the panel directly. To reach a key on another page you have to go via the Artist system instead:
+
+- **Toggle Key Mute on ANY Page (via Artist/RRCS - blind toggle)**: toggles mute on any page, any expansion panel.
+
+> **This is a blind toggle, and that is not a limitation of the module.** Artist exposes no way to *read* per-key mute state, so there is nothing to compare against - the action flips whatever the key currently is. It cannot be made idempotent, and pressing it twice returns to the start. Where the key is on the page the panel is showing, use **Set Key Mute (state-aware)** instead and you get the idempotent behaviour.
+
+| | Set Key Mute (state-aware) | Toggle Key Mute on ANY Page |
+| --- | --- | --- |
+| Route | the panel, directly | Artist (RRCS) |
+| Reaches | the displayed page only | **any page, any expansion panel** |
+| Reads state first | **yes** - only actuates when it differs | no - blind toggle |
+| Safe to repeat | **yes**, idempotent | no, each press flips it |
+| Needs | panel IP | Artist section in config |
+
+**Setup.** Fill in the **Artist / RRCS** section of the connection config:
+
+| Field | Value |
+| --- | --- |
+| RRCS Host | the Artist gateway running RRCS (leave blank to disable the feature entirely) |
+| RRCS Port | usually `8193` |
+| Artist Node / Artist Port | **this panel's** address in Artist |
+
+To find Node/Port, look the panel up in Director, or call the RRCS method `GetAllPorts` and match on the panel name - the reply carries `Node`, `Port`, `KeyCount` and `PageCount` for every port in the system.
+
 ### Volume (ganged trim)
 
 Each key has its own rotary encoder that sets that conference's listen level.

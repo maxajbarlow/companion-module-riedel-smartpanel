@@ -7,6 +7,10 @@ export interface DeviceConfig {
 	port?: number
 	enableKeyEvents?: boolean
 	enableMuteState?: boolean
+	rrcsHost?: string
+	rrcsPort?: number
+	artistNode?: number
+	artistPort?: number
 	enableRotaryGang?: boolean
 	gangSourcePanel?: number
 	gangSourceKey?: number
@@ -73,6 +77,54 @@ export function getConfigFields(): SomeCompanionConfigField[] {
 			width: 12,
 			default: false,
 			isVisible: (options) => options['enableKeyEvents'] === true,
+		},
+		// --- Artist / RRCS (optional) ---
+		// The panel's own API can only reach keys on the page it is currently showing.
+		// RRCS addresses keys by page, so it can mute a key on a page nobody is looking
+		// at. Leave the host blank and none of it is used.
+		{
+			type: 'static-text',
+			id: 'rrcs-info',
+			width: 12,
+			label: 'Artist / RRCS (optional)',
+			value:
+				'Fill this in only if you need to mute keys on a shift page the panel is not displaying. Find Node/Port in Director, or via the RRCS method GetAllPorts (match on the panel name).',
+		},
+		{
+			type: 'textinput',
+			id: 'rrcsHost',
+			label: 'RRCS Host (Artist gateway) - leave blank to disable',
+			width: 8,
+			default: '',
+		},
+		{
+			type: 'number',
+			id: 'rrcsPort',
+			label: 'RRCS Port',
+			width: 4,
+			default: 8193,
+			min: 1,
+			max: 65535,
+		},
+		{
+			type: 'number',
+			id: 'artistNode',
+			label: "This panel's Artist Node address",
+			width: 6,
+			default: 0,
+			min: 0,
+			max: 999,
+			isVisible: (options) => !!options['rrcsHost'],
+		},
+		{
+			type: 'number',
+			id: 'artistPort',
+			label: "This panel's Artist Port address",
+			width: 6,
+			default: 0,
+			min: 0,
+			max: 9999,
+			isVisible: (options) => !!options['rrcsHost'],
 		},
 		// Ganged volume trim. Also opt-in: with it off the module never sends a rotary
 		// step of its own, so an upgraded connection behaves exactly as before.

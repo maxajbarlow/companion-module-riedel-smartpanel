@@ -15,6 +15,8 @@ Bitfocus Companion module for controlling Riedel Smart Panels via WebSocket.
 - **Identify**: Enable/disable/toggle the panel's identify LEDs, or flash them a specific number of times (locate the physical panel)
 - **Identify (Custom IP)**: Same enable/disable/flash actions, but targeting an IP given per action call (supports Companion variables) instead of this connection's configured panel - see [Targeting Multiple Panels](#targeting-multiple-panels-without-a-dedicated-connection) below
 
+- **Mute on any shift page (via Artist/RRCS)**: the actions above reach only the page the panel is currently displaying. **Toggle Key Mute on ANY Page** goes via the Artist system instead and can mute a key on a page nobody is looking at - see [Muting other shift pages](#muting-other-shift-pages) below
+
 ### Feedbacks
 
 - **Connection Status**: Visual indicator for WebSocket connection state
@@ -80,6 +82,35 @@ The Smart Panel has three network interfaces:
 - **Media2**: Secondary media interface
 
 See also [companion/HELP.md](./companion/HELP.md) for full action and feedback details.
+
+## Muting other shift pages
+
+The panel's own API only ever exposes the shift page it is currently displaying - both for reading mute state (which is decoded from the rendered key images) and for pressing keys. A key on another page cannot be reached that way at all.
+
+The **Artist / RRCS** section of the connection config unlocks a second route. RRCS addresses keys as `Node . Port . Page . ExpansionPanel . KeyNumber`, so page is just a parameter:
+
+- **Toggle Key Mute on ANY Page (via Artist/RRCS - blind toggle)**
+
+**It is a blind toggle by necessity.** Artist provides no way to read per-key mute state, so the action cannot compare against anything - it flips whatever the key currently is. This is why it is named and described separately from the state-aware panel actions rather than folded into them:
+
+| | Set Key Mute (state-aware) | Toggle Key Mute on ANY Page |
+| --- | --- | --- |
+| Route | the panel, directly | Artist (RRCS) |
+| Reaches | displayed page only | **any page, any expansion panel** |
+| Reads state first | **yes** - only actuates when it differs | no |
+| Safe to repeat | **yes**, idempotent | no, each press flips it |
+
+Prefer the state-aware action whenever the key is on the displayed page.
+
+### Configuration
+
+| Field | Value |
+| --- | --- |
+| RRCS Host | Artist gateway running RRCS. Leave blank to disable the feature |
+| RRCS Port | usually `8193` |
+| Artist Node / Artist Port | this panel's address in Artist |
+
+Find Node/Port in Director, or call the RRCS method `GetAllPorts` and match on the panel name; the reply includes `Node`, `Port`, `KeyCount` and `PageCount` for every port.
 
 ## Targeting Multiple Panels Without a Dedicated Connection
 

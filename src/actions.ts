@@ -2,6 +2,7 @@ import { Regex, CompanionActionDefinitions } from '@companion-module/base'
 import type { RiedelRSP1232HLInstance } from './main.js'
 import { parseKeySpec } from './keys.js'
 import { PANEL_CHOICES } from './panels.js'
+import { pressKeyMomentary, describeErrorCode, TRIGGER_ENCODER_MUTE } from './rrcs.js'
 
 export function getActions(instance: RiedelRSP1232HLInstance): CompanionActionDefinitions {
 	return {
@@ -859,6 +860,78 @@ export function getActions(instance: RiedelRSP1232HLInstance): CompanionActionDe
 					(await context.parseVariablesInString(String(action.options.slot ?? 'default'))).trim() || 'default'
 				const existed = instance.clearMuteSnapshot(slot)
 				instance.log('info', `Clear Mute Snapshot: "${slot}" ${existed ? 'cleared' : 'did not exist'}`)
+			},
+		},
+
+		// --- Artist / RRCS: reaches pages the panel is not displaying ---
+		// Deliberately named and described so it cannot be confused with the
+		// state-aware actions above: this one CANNOT read state, so it toggles.
+		rrcsToggleKeyMuteAnyPage: {
+			name: 'Toggle Key Mute on ANY Page (via Artist/RRCS - blind toggle)',
+			description:
+				'Toggle mute on a key on ANY shift page, including pages the panel is not currently showing. Goes via the Artist system (RRCS), not the panel, so it needs the Artist section filled in under connection config. WARNING: this is a blind TOGGLE - Artist exposes no way to read mute state, so it flips whatever the key currently is. It cannot be made idempotent. For keys on the page the panel IS showing, prefer "Set Key Mute (state-aware)" instead.',
+			options: [
+				{
+					type: 'number',
+					label: 'Page (1 = first shift page)',
+					id: 'page',
+					default: 1,
+					min: 1,
+					max: 8,
+				},
+				{
+					type: 'dropdown',
+					label: 'Panel',
+					id: 'expansionPanel',
+					default: 0,
+					choices: PANEL_CHOICES,
+				},
+				{
+					type: 'textinput',
+					label: 'Key Number (1 - 32)',
+					id: 'keyNumber',
+					default: '1',
+					useVariables: true,
+				},
+			],
+			callback: async (action, context) => {
+				const host = String(instance.config.rrcsHost ?? '').trim()
+				if (!host) {
+					instance.log(
+						'warn',
+						'Toggle Key Mute on ANY Page: no RRCS host configured - see the Artist section in connection config',
+					)
+					return
+				}
+				const node = Number(instance.config.artistNode ?? 0)
+				const port = Number(instance.config.artistPort ?? 0)
+				if (!node && !port) {
+					instance.log('warn', "Toggle Key Mute on ANY Page: this panel's Artist Node/Port are not set")
+					return
+				}
+				const keyNumber = parseInt(await context.parseVariablesInString(String(action.options.keyNumber ?? '1')), 10)
+				if (isNaN(keyNumber)) {
+					instance.log('warn', 'Toggle Key Mute on ANY Page: invalid key number')
+					return
+				}
+				const page = Number(action.options.page ?? 1)
+				const expansionPanel = Number(action.options.expansionPanel ?? 0)
+				try {
+					const code = await pressKeyMomentary(
+						{ host, port: Number(instance.config.rrcsPort ?? 8193) },
+						{ node, port, page, expansionPanel, keyNumber, trigger: TRIGGER_ENCODER_MUTE },
+					)
+					if (code === 0) {
+						instance.log(
+							'info',
+							`Toggle Key Mute on ANY Page: toggled page ${page} panel ${expansionPanel} key ${keyNumber}`,
+						)
+					} else {
+						instance.log('warn', `Toggle Key Mute on ANY Page: RRCS returned ${describeErrorCode(code)}`)
+					}
+				} catch (error) {
+					instance.log('error', `Toggle Key Mute on ANY Page failed: ${error}`)
+				}
 			},
 		},
 
