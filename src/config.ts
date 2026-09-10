@@ -1,4 +1,5 @@
 import { Regex, type SomeCompanionConfigField } from '@companion-module/base'
+import { PANEL_CHOICES } from './panels.js'
 
 export interface DeviceConfig {
 	bonjourHost?: string
@@ -12,14 +13,6 @@ export interface DeviceConfig {
 	gangTargetPanel?: number
 	gangTargetKeys?: string
 }
-
-export const PANEL_CHOICES = [
-	{ id: 0, label: 'Master Panel (Panel 0)' },
-	{ id: 1, label: 'Expansion Panel 1 (Panel 1)' },
-	{ id: 2, label: 'Expansion Panel 2 (Panel 2)' },
-	{ id: 3, label: 'Expansion Panel 3 (Panel 3)' },
-	{ id: 4, label: 'Expansion Panel 4 (Panel 4)' },
-]
 
 export function getConfigFields(): SomeCompanionConfigField[] {
 	return [

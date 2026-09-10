@@ -1,7 +1,7 @@
 import { Regex, CompanionActionDefinitions } from '@companion-module/base'
 import type { RiedelRSP1232HLInstance } from './main.js'
 import { parseKeySpec } from './keys.js'
-import { PANEL_CHOICES } from './config.js'
+import { PANEL_CHOICES } from './panels.js'
 
 export function getActions(instance: RiedelRSP1232HLInstance): CompanionActionDefinitions {
 	return {
@@ -585,8 +585,15 @@ export function getActions(instance: RiedelRSP1232HLInstance): CompanionActionDe
 		setKeyMute: {
 			name: 'Set Key Mute (state-aware)',
 			description:
-				'Set a key muted or unmuted. Reads the real mute state from the panel and only actuates when it differs, so repeated presses are safe. Requires "Monitor mute state". Master panel.',
+				'Set a key muted or unmuted. Reads the real mute state from the panel and only actuates when it differs, so repeated presses are safe. Requires "Monitor mute state".',
 			options: [
+				{
+					type: 'dropdown',
+					label: 'Panel',
+					id: 'panelId',
+					default: 0,
+					choices: PANEL_CHOICES,
+				},
 				{
 					type: 'textinput',
 					label: 'Key Number (1 - 32)',
@@ -615,35 +622,46 @@ export function getActions(instance: RiedelRSP1232HLInstance): CompanionActionDe
 				},
 			],
 			callback: async (action, context) => {
+				const panelId = Number(action.options.panelId ?? 0)
 				const parsed = await context.parseVariablesInString(String(action.options.keyNumber ?? '1'))
 				const keyNumber = parseInt(parsed, 10) || 1
 				const durationMs = Number(action.options.durationMs ?? 250)
 				const want = String(action.options.state ?? 'on')
 				if (want === 'toggle') {
-					await instance.toggleKeyMute(0, keyNumber, durationMs)
+					await instance.toggleKeyMute(panelId, keyNumber, durationMs)
 					return
 				}
 				const desired = want === 'on'
-				const current = instance.getKeyMuted(keyNumber)
+				const current = instance.getKeyMuted(panelId, keyNumber)
 				if (current === undefined) {
 					instance.log(
 						'warn',
-						`Set Key Mute: mute state for key ${keyNumber} is unknown - enable "Monitor mute state" and make sure the key is on the displayed shift page. Not actuating.`,
+						`Set Key Mute: mute state for panel ${panelId} key ${keyNumber} is unknown - enable "Monitor mute state" and make sure the key is on the displayed shift page. Not actuating.`,
 					)
 					return
 				}
 				if (current === desired) {
-					instance.log('debug', `Set Key Mute: key ${keyNumber} already ${desired ? 'muted' : 'unmuted'}`)
+					instance.log(
+						'debug',
+						`Set Key Mute: panel ${panelId} key ${keyNumber} already ${desired ? 'muted' : 'unmuted'}`,
+					)
 					return
 				}
-				await instance.toggleKeyMute(0, keyNumber, durationMs)
+				await instance.toggleKeyMute(panelId, keyNumber, durationMs)
 			},
 		},
 		setKeyMuteMultiple: {
 			name: 'Set Mute on Multiple Keys (state-aware)',
 			description:
-				'Mute or unmute a set of keys in one action, e.g. "1-8" or "1,3,5-7". Only keys whose state differs are actuated, so this is safe to repeat - ideal for a focus-mute shortcut. Requires "Monitor mute state". Master panel.',
+				'Mute or unmute a set of keys in one action, e.g. "1-8" or "1,3,5-7". Only keys whose state differs are actuated, so this is safe to repeat - ideal for a focus-mute shortcut. Requires "Monitor mute state".',
 			options: [
+				{
+					type: 'dropdown',
+					label: 'Panel',
+					id: 'panelId',
+					default: 0,
+					choices: PANEL_CHOICES,
+				},
 				{
 					type: 'textinput',
 					label: 'Keys (e.g. 1-8 or 1,3,5-7)',
@@ -671,6 +689,7 @@ export function getActions(instance: RiedelRSP1232HLInstance): CompanionActionDe
 				},
 			],
 			callback: async (action, context) => {
+				const panelId = Number(action.options.panelId ?? 0)
 				const spec = await context.parseVariablesInString(String(action.options.keys ?? ''))
 				const keys = parseKeySpec(spec)
 				if (keys.length === 0) {
@@ -684,7 +703,7 @@ export function getActions(instance: RiedelRSP1232HLInstance): CompanionActionDe
 				const changed: number[] = []
 				const unknown: number[] = []
 				for (const key of keys) {
-					const current = instance.getKeyMuted(key)
+					const current = instance.getKeyMuted(panelId, key)
 					if (current === undefined) {
 						unknown.push(key)
 						continue
@@ -693,7 +712,7 @@ export function getActions(instance: RiedelRSP1232HLInstance): CompanionActionDe
 					changed.push(key)
 				}
 				if (changed.length > 0) {
-					await instance.toggleKeyMutes(0, changed, durationMs)
+					await instance.toggleKeyMutes(panelId, changed, durationMs)
 				}
 				if (unknown.length > 0) {
 					instance.log(
@@ -715,6 +734,13 @@ export function getActions(instance: RiedelRSP1232HLInstance): CompanionActionDe
 				'Record which keys are currently muted so you can put them back later with Restore Mute State. Leave Keys empty to capture every key whose state is known. Requires "Monitor mute state".',
 			options: [
 				{
+					type: 'dropdown',
+					label: 'Panel',
+					id: 'panelId',
+					default: 0,
+					choices: PANEL_CHOICES,
+				},
+				{
 					type: 'textinput',
 					label: 'Snapshot name',
 					id: 'slot',
@@ -732,9 +758,10 @@ export function getActions(instance: RiedelRSP1232HLInstance): CompanionActionDe
 			callback: async (action, context) => {
 				const slot =
 					(await context.parseVariablesInString(String(action.options.slot ?? 'default'))).trim() || 'default'
+				const panelId = Number(action.options.panelId ?? 0)
 				const spec = await context.parseVariablesInString(String(action.options.keys ?? ''))
 				const keys = spec.trim() ? parseKeySpec(spec) : null
-				const { captured, unknown } = instance.captureMuteSnapshot(slot, keys)
+				const { captured, unknown } = instance.captureMuteSnapshot(slot, panelId, keys)
 				if (captured.length === 0) {
 					instance.log(
 						'warn',
@@ -781,30 +808,37 @@ export function getActions(instance: RiedelRSP1232HLInstance): CompanionActionDe
 					instance.log('warn', `Restore Mute State: no snapshot named "${slot}" - capture one first.`)
 					return
 				}
-				// Collect every key that drifted from the snapshot, then put them all back
-				// in one batch so an undo lands at once rather than key by key.
-				const restored: number[] = []
-				const unknown: number[] = []
-				for (const [keyNumber, wasMuted] of snapshot) {
-					const current = instance.getKeyMuted(keyNumber)
+				// Collect every key that drifted from the snapshot, grouped by panel, then
+				// put each panel's keys back in one batch so an undo lands at once rather
+				// than key by key. A snapshot may span several panels.
+				const restoreByPanel = new Map<number, number[]>()
+				const unknown: string[] = []
+				for (const [entry, wasMuted] of snapshot) {
+					const [panelPart, keyPart] = entry.split(':')
+					const panelId = Number(panelPart)
+					const keyNumber = Number(keyPart)
+					const current = instance.getKeyMuted(panelId, keyNumber)
 					if (current === undefined) {
-						unknown.push(keyNumber)
+						unknown.push(entry)
 						continue
 					}
 					if (current === wasMuted) continue
-					restored.push(keyNumber)
+					const list = restoreByPanel.get(panelId) ?? []
+					list.push(keyNumber)
+					restoreByPanel.set(panelId, list)
 				}
-				if (restored.length > 0) {
-					await instance.toggleKeyMutes(0, restored, durationMs)
+				for (const [panelId, keys] of restoreByPanel) {
+					await instance.toggleKeyMutes(panelId, keys, durationMs)
 				}
 				if (unknown.length > 0) {
-					instance.log('warn', `Restore Mute State: state unknown for key(s) ${unknown.join(',')} - not restored.`)
+					instance.log('warn', `Restore Mute State: state unknown for ${unknown.join(',')} - not restored.`)
 				}
+				const summary = [...restoreByPanel.entries()]
+					.map(([panelId, keys]) => `panel ${panelId}: ${keys.join(',')}`)
+					.join(' | ')
 				instance.log(
 					'info',
-					`Restore Mute State "${slot}": restored ${
-						restored.length > 0 ? restored.join(',') : 'nothing (already matches the snapshot)'
-					}`,
+					`Restore Mute State "${slot}": restored ${summary || 'nothing (already matches the snapshot)'}`,
 				)
 			},
 		},

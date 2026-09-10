@@ -1,6 +1,12 @@
 import { CompanionVariableDefinition, CompanionVariableValues } from '@companion-module/base'
+import { variablePrefix, panelLabel, MASTER_PANEL } from './panels.js'
 
-export function getVariableDefinitions(): CompanionVariableDefinition[] {
+/**
+ * Variable definitions. `panels` lists the panels to expose key state for -
+ * the master alone until expansion panels are discovered, then one set per panel.
+ * The master's names are unprefixed so existing buttons keep working.
+ */
+export function getVariableDefinitions(panels: number[] = [MASTER_PANEL]): CompanionVariableDefinition[] {
 	const defs: CompanionVariableDefinition[] = [
 		{
 			name: 'Connection Status',
@@ -176,14 +182,6 @@ export function getVariableDefinitions(): CompanionVariableDefinition[] {
 			variableId: 'last_button_panel',
 		},
 		{
-			name: 'Muted Keys (comma-separated key numbers)',
-			variableId: 'muted_keys',
-		},
-		{
-			name: 'Muted Key Count',
-			variableId: 'muted_count',
-		},
-		{
 			name: 'Mute Snapshot: stored slot names',
 			variableId: 'mute_snapshot_slots',
 		},
@@ -200,6 +198,14 @@ export function getVariableDefinitions(): CompanionVariableDefinition[] {
 			variableId: 'mute_snapshot_last_size',
 		},
 		{
+			name: 'Panels Detected (comma-separated panel ids)',
+			variableId: 'panels',
+		},
+		{
+			name: 'Panel Count (master + attached expansion panels)',
+			variableId: 'panel_count',
+		},
+		{
 			name: 'Last Rotary Key (most recent encoder turn, 1-based)',
 			variableId: 'last_rotary_key',
 		},
@@ -211,25 +217,34 @@ export function getVariableDefinitions(): CompanionVariableDefinition[] {
 			name: 'Last Rotary Panel (0 = master, 1-4 = expansion)',
 			variableId: 'last_rotary_panel',
 		},
-		{
-			name: 'Key Volumes (key:percent, comma-separated)',
-			variableId: 'volume_levels',
-		},
 	]
-	// Per-key mute state on the master panel, decoded from the rendered key displays.
-	// Empty string until the state is known (monitoring off, or key not on the
-	// currently displayed shift page).
-	for (let key = 1; key <= 32; key++) {
+	// Per-key mute state and volume, decoded from the rendered key displays, for
+	// every known panel. Empty string until the state is known (monitoring off, or
+	// key not on the currently displayed shift page).
+	for (const panelId of panels) {
+		const prefix = variablePrefix(panelId)
+		const label = panelLabel(panelId)
 		defs.push({
-			name: `Key ${key} Muted (true/false)`,
-			variableId: `key_${key}_muted`,
+			name: `${label}: Muted Keys (comma-separated key numbers)`,
+			variableId: `${prefix}muted_keys`,
 		})
-		// Volume comes from the same decoded frames. Empty for an unassigned key,
-		// which draws no volume bar at all.
+		defs.push({ name: `${label}: Muted Key Count`, variableId: `${prefix}muted_count` })
 		defs.push({
-			name: `Key ${key} Volume (0-100, empty if unassigned)`,
-			variableId: `key_${key}_volume`,
+			name: `${label}: Key Volumes (key:percent, comma-separated)`,
+			variableId: `${prefix}volume_levels`,
 		})
+		for (let key = 1; key <= 32; key++) {
+			defs.push({
+				name: `${label}: Key ${key} Muted (true/false)`,
+				variableId: `${prefix}key_${key}_muted`,
+			})
+			// Volume comes from the same decoded frames. Empty for an unassigned key,
+			// which draws no volume bar at all.
+			defs.push({
+				name: `${label}: Key ${key} Volume (0-100, empty if unassigned)`,
+				variableId: `${prefix}key_${key}_volume`,
+			})
+		}
 	}
 	return defs
 }
@@ -277,8 +292,6 @@ export function getDefaultVariableValues(): CompanionVariableValues {
 		last_button_key: '',
 		last_button_state: '',
 		last_button_panel: '',
-		muted_keys: '',
-		muted_count: '0',
 		mute_snapshot_slots: '',
 		mute_snapshot_last: '',
 		mute_snapshot_last_muted: '',
@@ -286,11 +299,18 @@ export function getDefaultVariableValues(): CompanionVariableValues {
 		last_rotary_key: '',
 		last_rotary_steps: '',
 		last_rotary_panel: '',
-		volume_levels: '',
+		panels: '0',
+		panel_count: '1',
 	}
-	for (let key = 1; key <= 32; key++) {
-		values[`key_${key}_muted`] = ''
-		values[`key_${key}_volume`] = ''
+	for (const panelId of [0, 1, 2, 3, 4]) {
+		const prefix = variablePrefix(panelId)
+		values[`${prefix}muted_keys`] = ''
+		values[`${prefix}muted_count`] = '0'
+		values[`${prefix}volume_levels`] = ''
+		for (let key = 1; key <= 32; key++) {
+			values[`${prefix}key_${key}_muted`] = ''
+			values[`${prefix}key_${key}_volume`] = ''
+		}
 	}
 	return values
 }

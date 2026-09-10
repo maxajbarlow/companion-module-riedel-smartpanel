@@ -13,6 +13,7 @@ import { getVariableDefinitions, getDefaultVariableValues } from './variables.js
 import WebSocket from 'ws'
 import * as jpeg from 'jpeg-js'
 import { parseKeySpec } from './keys.js'
+import { variablePrefix, ALL_PANEL_IDS } from './panels.js'
 
 interface NetworkTarget {
 	ip: string
@@ -94,9 +95,10 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 	// pushes an updated JPEG whenever a key's rendering changes (including mute). We
 	// decode the glyph region per key to recover true mute state, which lets the
 	// Set Key Mute actions be idempotent instead of blindly toggling.
-	// Master panel (panelId 0) only: the binary display frames carry a display index
-	// but no panelId, so we cannot attribute pushed frames to expansion panels.
-	private mutedKeys: Map<number, boolean> = new Map() // 0-based keyId -> muted
+	// Display frames are per panel: the binary header is
+	//   uint8 panelId | uint8 displayId | uint16 mimeLen | mime | JPEG
+	// so an expansion panel's keys are recoverable too, keyed `${panelId}:${keyId}`.
+	private mutedKeys: Map<string, boolean> = new Map() // `${panelId}:${keyId}` -> muted
 	private static readonly MUTE_GRID_COLS = 8
 	private static readonly MUTE_GRID_ROWS = 2
 	private static readonly MUTE_RED_THRESHOLD = 0.02
@@ -107,7 +109,7 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 	// delta that reads 0 at rest, not a position), so the rendered bar is the only
 	// way to recover an absolute level. We take the rightmost bright pixel on the
 	// bar row as the fill extent. An unassigned key draws no bar at all -> undefined.
-	private volumeLevels: Map<number, number> = new Map() // 0-based keyId -> 0..1
+	private volumeLevels: Map<string, number> = new Map() // `${panelId}:${keyId}` -> 0..1
 	private static readonly VOLUME_BAR_TOP = 0.66
 	private static readonly VOLUME_BAR_BOTTOM = 0.74
 	private static readonly VOLUME_BAR_BRIGHT = 90
@@ -118,15 +120,20 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 	// slot name -> (1-based keyNumber -> was muted). Held in memory only: a snapshot
 	// is a within-session undo point and is intentionally not persisted across a
 	// Companion restart.
-	private muteSnapshots: Map<string, Map<number, boolean>> = new Map()
+	private muteSnapshots: Map<string, Map<string, boolean>> = new Map()
 	private lastSnapshotSlot = ''
+
+	// Panels present on this device, learned from FetchPanelInfo on the live-view
+	// socket. Master is always 0; expansion panels appear as 1-4 when attached.
+	// Used to request display content per panel and to define per-panel variables.
+	private knownPanels: number[] = [0]
 
 	// Last values actually pushed to Companion, so we only send what changed.
 	// Every variable write crosses the IPC boundary into the shared Companion
 	// process; a fleet of panels all re-sending 64 unchanged values on every
 	// display frame adds up there, even though each module runs in its own process.
-	private publishedMute: Map<number, string> = new Map()
-	private publishedVolume: Map<number, string> = new Map()
+	private publishedMute: Map<string, string> = new Map()
+	private publishedVolume: Map<string, string> = new Map()
 
 	constructor(internal: unknown) {
 		super(internal)
@@ -345,9 +352,15 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 				// Subscribing makes the panel push key events *and* an updated display
 				// image whenever a key's rendering changes (including mute).
 				this.sendLiveView('/LiveView/SubscribePanelEvents', { panelId: 0 })
+				// Ask which panels are actually attached, so we only define variables
+				// and request displays for panels that exist.
+				this.sendLiveView('/LiveView/FetchPanelInfo', {})
 				if (this.config.enableMuteState === true) {
-					// One-shot snapshot so mute state is known before anything changes.
-					this.sendLiveView('/LiveView/RequestDisplayContent', { panelId: 0 })
+					// One-shot snapshot per panel so state is known before anything changes.
+					// Requesting a panel that is not attached simply returns nothing.
+					for (const panelId of ALL_PANEL_IDS) {
+						this.sendLiveView('/LiveView/RequestDisplayContent', { panelId })
+					}
 				}
 			})
 			this.liveViewWs.on('message', (data: WebSocket.Data, isBinary: boolean) => {
@@ -410,18 +423,24 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 		}
 	}
 
-	// Decode a pushed display frame and recover per-key mute state.
-	// Frame layout: uint16 displayIndex | uint16 mimeLen | mime | <image bytes>
+	// Decode a pushed display frame and recover per-key mute state and volume.
+	// Frame layout: uint8 panelId | uint8 displayId | uint16 mimeLen | mime | <image bytes>
 	// Display 0 = keys 1-16, display 1 = keys 17-32 (8 cols x 2 rows each).
 	// Display 2 is the centre info screen and carries no key cells.
+	// panelId identifies which panel the frame came from, so expansion panels
+	// (1-4) decode exactly like the master. Reading the first two bytes as one
+	// uint16 happens to work for the master panel only, because panelId 0 leaves
+	// the value equal to displayId - every expansion frame would be discarded.
 	private handleDisplayFrame(buf: Buffer): void {
 		if (buf.length < 6) return
-		const displayIndex = buf.readUInt16BE(0)
+		const panelId = buf.readUInt8(0)
+		const displayId = buf.readUInt8(1)
 		const mimeLen = buf.readUInt16BE(2)
 		if (buf.length < 4 + mimeLen) return
 		const mime = buf.subarray(4, 4 + mimeLen).toString('ascii')
 		if (!mime.includes('jp')) return // image/jpg or image/jpeg
-		if (displayIndex !== 0 && displayIndex !== 1) return // keybank displays only
+		if (displayId !== 0 && displayId !== 1) return // keybank displays only
+		this.notePanelSeen(panelId)
 		const payload = buf.subarray(4 + mimeLen)
 		let img: jpeg.RawImageData<Uint8Array>
 		try {
@@ -434,7 +453,7 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 		const rows = RiedelRSP1232HLInstance.MUTE_GRID_ROWS
 		const cw = img.width / cols
 		const ch = img.height / rows
-		const baseKey = displayIndex * cols * rows
+		const baseKey = displayId * cols * rows
 		let changed = false
 		let volumeChanged = false
 		for (let row = 0; row < rows; row++) {
@@ -451,18 +470,19 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 					Math.floor(y0 + ch * 0.3),
 				)
 				const muted = frac > RiedelRSP1232HLInstance.MUTE_RED_THRESHOLD
-				if (this.mutedKeys.get(keyId) !== muted) changed = true
-				this.mutedKeys.set(keyId, muted)
+				const slot = `${panelId}:${keyId}`
+				if (this.mutedKeys.get(slot) !== muted) changed = true
+				this.mutedKeys.set(slot, muted)
 
 				const level = this.barFraction(img, x0, y0, cw, ch)
-				const previous = this.volumeLevels.get(keyId)
+				const previous = this.volumeLevels.get(slot)
 				if (level === undefined) {
 					if (previous !== undefined) {
-						this.volumeLevels.delete(keyId)
+						this.volumeLevels.delete(slot)
 						volumeChanged = true
 					}
 				} else if (previous === undefined || Math.abs(previous - level) > RiedelRSP1232HLInstance.VOLUME_EPSILON) {
-					this.volumeLevels.set(keyId, level)
+					this.volumeLevels.set(slot, level)
 					volumeChanged = true
 				}
 			}
@@ -525,35 +545,43 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 
 	private publishVolumeState(): void {
 		const values: CompanionVariableValues = {}
-		const summary: string[] = []
-		for (let keyId = 0; keyId < 32; keyId++) {
-			const level = this.volumeLevels.get(keyId)
-			const text = level === undefined ? '' : String(Math.round(level * 100))
-			if (this.publishedVolume.get(keyId) !== text) {
-				values[`key_${keyId + 1}_volume`] = text
-				this.publishedVolume.set(keyId, text)
+		for (const panelId of this.knownPanels) {
+			const prefix = variablePrefix(panelId)
+			const summary: string[] = []
+			for (let keyId = 0; keyId < 32; keyId++) {
+				const slot = `${panelId}:${keyId}`
+				const level = this.volumeLevels.get(slot)
+				const text = level === undefined ? '' : String(Math.round(level * 100))
+				if (this.publishedVolume.get(slot) !== text) {
+					values[`${prefix}key_${keyId + 1}_volume`] = text
+					this.publishedVolume.set(slot, text)
+				}
+				if (text !== '') summary.push(`${keyId + 1}:${text}`)
 			}
-			if (text !== '') summary.push(`${keyId + 1}:${text}`)
+			values[`${prefix}volume_levels`] = summary.join(',')
 		}
-		values.volume_levels = summary.join(',')
 		this.setVariableValues(values)
 		this.checkFeedbacks('keyVolume')
 	}
 
 	private publishMuteState(): void {
 		const values: CompanionVariableValues = {}
-		const mutedList: number[] = []
-		for (let keyId = 0; keyId < 32; keyId++) {
-			const muted = this.mutedKeys.get(keyId)
-			const text = muted === undefined ? '' : muted ? 'true' : 'false'
-			if (this.publishedMute.get(keyId) !== text) {
-				values[`key_${keyId + 1}_muted`] = text
-				this.publishedMute.set(keyId, text)
+		for (const panelId of this.knownPanels) {
+			const prefix = variablePrefix(panelId)
+			const mutedList: number[] = []
+			for (let keyId = 0; keyId < 32; keyId++) {
+				const slot = `${panelId}:${keyId}`
+				const muted = this.mutedKeys.get(slot)
+				const text = muted === undefined ? '' : muted ? 'true' : 'false'
+				if (this.publishedMute.get(slot) !== text) {
+					values[`${prefix}key_${keyId + 1}_muted`] = text
+					this.publishedMute.set(slot, text)
+				}
+				if (muted) mutedList.push(keyId + 1)
 			}
-			if (muted) mutedList.push(keyId + 1)
+			values[`${prefix}muted_keys`] = mutedList.join(',')
+			values[`${prefix}muted_count`] = String(mutedList.length)
 		}
-		values.muted_keys = mutedList.join(',')
-		values.muted_count = String(mutedList.length)
 		this.setVariableValues(values)
 		// A restore button's "differs from snapshot" styling depends on live mute state.
 		this.checkFeedbacks('keyMuted', 'muteSnapshotDiffers')
@@ -592,6 +620,19 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 				last_button_state: buttonState,
 			})
 			this.checkFeedbacks('keyButtonState')
+		} else if (topic === '/LiveView/FetchPanelInfoResponse') {
+			// { panels: [{ panelId, panelType, customName, firmwareVersion }, ...] }
+			const panels = Array.isArray(body.panels) ? body.panels : []
+			const ids = panels
+				.map((p) => (typeof p === 'object' && p !== null ? Number((p as Record<string, unknown>).panelId) : NaN))
+				.filter((id) => Number.isInteger(id) && id >= 0)
+			if (ids.length > 0) {
+				const merged = [...new Set([0, ...ids])].sort((a, b) => a - b)
+				if (merged.join(',') !== this.knownPanels.join(',')) {
+					this.knownPanels = merged
+					this.refreshPanelVariables()
+				}
+			}
 		} else if (topic === '/LiveView/LeverKeyRotaryTurned') {
 			const panelId = Number(body.panelId ?? 0)
 			const keyId = Number(body.keyId)
@@ -1387,9 +1428,31 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 	}
 
 	// Getter methods for feedbacks
-	public getKeyVolume(keyNumber: number): number | undefined {
-		const level = this.volumeLevels.get(keyNumber - 1)
+	public getKeyVolume(panelId: number, keyNumber: number): number | undefined {
+		const level = this.volumeLevels.get(`${panelId}:${keyNumber - 1}`)
 		return level === undefined ? undefined : Math.round(level * 100)
+	}
+
+	/** Panels currently known to be attached (always includes the master, 0). */
+	public getKnownPanels(): number[] {
+		return [...this.knownPanels]
+	}
+
+	/**
+	 * Record a panel we have seen traffic from. Display frames name their panel, so
+	 * an expansion panel becomes known even if FetchPanelInfo was missed.
+	 */
+	private notePanelSeen(panelId: number): void {
+		if (this.knownPanels.includes(panelId)) return
+		this.knownPanels = [...this.knownPanels, panelId].sort((a, b) => a - b)
+		this.refreshPanelVariables()
+	}
+
+	/** Redefine variables so newly discovered expansion panels get their own set. */
+	private refreshPanelVariables(): void {
+		this.setVariableDefinitions(getVariableDefinitions(this.knownPanels))
+		this.setVariableValues({ panels: this.knownPanels.join(','), panel_count: String(this.knownPanels.length) })
+		this.log('info', `Panels detected: ${this.knownPanels.join(', ')}`)
 	}
 
 	public isConnected(): boolean {
@@ -1444,10 +1507,10 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 	/**
 	 * True/false if the key's mute state is known, undefined if it isn't yet
 	 * (mute monitoring disabled, key on another shift page, or no snapshot yet).
-	 * Master panel only. keyNumber is 1-based.
+	 * keyNumber is 1-based; panelId 0 is the master, 1-4 expansion panels.
 	 */
-	public getKeyMuted(keyNumber: number): boolean | undefined {
-		return this.mutedKeys.get(keyNumber - 1)
+	public getKeyMuted(panelId: number, keyNumber: number): boolean | undefined {
+		return this.mutedKeys.get(`${panelId}:${keyNumber - 1}`)
 	}
 
 	/**
@@ -1455,18 +1518,27 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 	 * Pass a list of 1-based key numbers, or null for every key whose state is known.
 	 * Keys with unknown state cannot be captured and are reported back to the caller.
 	 */
-	public captureMuteSnapshot(slot: string, keys: number[] | null): { captured: number[]; unknown: number[] } {
+	public captureMuteSnapshot(
+		slot: string,
+		panelId: number,
+		keys: number[] | null,
+	): { captured: number[]; unknown: number[] } {
 		const candidates = keys && keys.length > 0 ? keys : Array.from({ length: 32 }, (_, i) => i + 1)
-		const snapshot = new Map<number, boolean>()
+		// Capturing a different panel into the same slot replaces that panel's entries
+		// but leaves other panels' entries intact, so one slot can span panels.
+		const snapshot = new Map(this.muteSnapshots.get(slot) ?? [])
+		for (const key of [...snapshot.keys()]) {
+			if (key.startsWith(`${panelId}:`)) snapshot.delete(key)
+		}
 		const captured: number[] = []
 		const unknown: number[] = []
 		for (const keyNumber of candidates) {
-			const muted = this.mutedKeys.get(keyNumber - 1)
+			const muted = this.mutedKeys.get(`${panelId}:${keyNumber - 1}`)
 			if (muted === undefined) {
 				unknown.push(keyNumber)
 				continue
 			}
-			snapshot.set(keyNumber, muted)
+			snapshot.set(`${panelId}:${keyNumber}`, muted)
 			captured.push(keyNumber)
 		}
 		if (snapshot.size > 0) {
@@ -1478,8 +1550,8 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 		return { captured, unknown }
 	}
 
-	/** The stored snapshot for a slot: 1-based keyNumber -> was muted. */
-	public getMuteSnapshot(slot: string): Map<number, boolean> | undefined {
+	/** The stored snapshot for a slot: `${panelId}:${keyNumber}` (1-based key) -> was muted. */
+	public getMuteSnapshot(slot: string): Map<string, boolean> | undefined {
 		return this.muteSnapshots.get(slot)
 	}
 
@@ -1501,8 +1573,9 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 	public muteSnapshotDiffers(slot: string): boolean {
 		const snapshot = this.muteSnapshots.get(slot)
 		if (!snapshot) return false
-		for (const [keyNumber, wasMuted] of snapshot) {
-			const current = this.mutedKeys.get(keyNumber - 1)
+		for (const [key, wasMuted] of snapshot) {
+			const [panelPart, keyPart] = key.split(':')
+			const current = this.mutedKeys.get(`${panelPart}:${Number(keyPart) - 1}`)
 			if (current !== undefined && current !== wasMuted) return true
 		}
 		return false
@@ -1510,11 +1583,14 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 
 	private publishSnapshotState(): void {
 		const last = this.muteSnapshots.get(this.lastSnapshotSlot)
+		// `panel:key` for expansion panels, bare key number for the master, so the
+		// common single-panel case reads exactly as it did before.
 		const lastMuted = last
 			? [...last.entries()]
 					.filter(([, muted]) => muted)
-					.map(([keyNumber]) => keyNumber)
-					.sort((a, b) => a - b)
+					.map(([key]) => key)
+					.sort()
+					.map((key) => (key.startsWith('0:') ? key.slice(2) : key))
 			: []
 		this.setVariableValues({
 			mute_snapshot_slots: [...this.muteSnapshots.keys()].join(','),

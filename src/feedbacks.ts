@@ -1,5 +1,6 @@
 import { CompanionFeedbackDefinitions } from '@companion-module/base'
 import type { RiedelRSP1232HLInstance } from './main.js'
+import { PANEL_CHOICES } from './panels.js'
 
 export function getFeedbacks(instance: RiedelRSP1232HLInstance): CompanionFeedbackDefinitions {
 	return {
@@ -660,12 +661,19 @@ export function getFeedbacks(instance: RiedelRSP1232HLInstance): CompanionFeedba
 			type: 'boolean',
 			name: 'Key Muted',
 			description:
-				'True when a key is muted. Decoded from the rendered key display, so it reflects real panel state. Requires "Monitor mute state"; master panel, currently displayed shift page.',
+				'True when a key is muted. Decoded from the rendered key display, so it reflects real panel state. Requires "Monitor mute state"; currently displayed shift page.',
 			defaultStyle: {
 				color: 0xffffff,
 				bgcolor: 0xff0000,
 			},
 			options: [
+				{
+					type: 'dropdown',
+					label: 'Panel',
+					id: 'panelId',
+					default: 0,
+					choices: PANEL_CHOICES,
+				},
 				{
 					type: 'number',
 					label: 'Key Number (1 - 32)',
@@ -686,8 +694,9 @@ export function getFeedbacks(instance: RiedelRSP1232HLInstance): CompanionFeedba
 				},
 			],
 			callback: (feedback) => {
+				const panelId = Number(feedback.options.panelId ?? 0)
 				const keyNumber = Number(feedback.options.keyNumber ?? 1)
-				const muted = instance.getKeyMuted(keyNumber)
+				const muted = instance.getKeyMuted(panelId, keyNumber)
 				if (muted === undefined) return false // state not known yet
 				return feedback.options.state === 'muted' ? muted : !muted
 			},
@@ -696,12 +705,19 @@ export function getFeedbacks(instance: RiedelRSP1232HLInstance): CompanionFeedba
 			type: 'boolean',
 			name: 'Key Volume',
 			description:
-				'Compare a key\'s volume (0-100) against a threshold. Decoded from the rendered volume bar. False for an unassigned key, which draws no bar. Requires "Monitor mute state and volume"; master panel, currently displayed shift page.',
+				'Compare a key\'s volume (0-100) against a threshold. Decoded from the rendered volume bar. False for an unassigned key, which draws no bar. Requires "Monitor mute state and volume"; currently displayed shift page.',
 			defaultStyle: {
 				color: 0xffffff,
 				bgcolor: 0x0066ff,
 			},
 			options: [
+				{
+					type: 'dropdown',
+					label: 'Panel',
+					id: 'panelId',
+					default: 0,
+					choices: PANEL_CHOICES,
+				},
 				{
 					type: 'number',
 					label: 'Key Number (1 - 32)',
@@ -730,8 +746,9 @@ export function getFeedbacks(instance: RiedelRSP1232HLInstance): CompanionFeedba
 				},
 			],
 			callback: (feedback) => {
+				const panelId = Number(feedback.options.panelId ?? 0)
 				const keyNumber = Number(feedback.options.keyNumber ?? 1)
-				const volume = instance.getKeyVolume(keyNumber)
+				const volume = instance.getKeyVolume(panelId, keyNumber)
 				if (volume === undefined) return false // unassigned key, or level not known yet
 				const threshold = Number(feedback.options.threshold ?? 0)
 				return feedback.options.op === 'gte' ? volume >= threshold : volume <= threshold

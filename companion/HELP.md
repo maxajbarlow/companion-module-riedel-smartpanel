@@ -60,14 +60,16 @@ This module requires the panel to be running firmware version 2.0.0 or later. Ea
 - **Set Key Mute (state-aware)**: Set a key **Muted** or **Unmuted** (or Toggle). Reads the panel's real mute state and only actuates when it differs — so pressing twice won't undo itself, and it's safe to fire repeatedly. Requires _Monitor mute state_.
 - **Set Mute on Multiple Keys (state-aware)**: Mute/unmute a whole set in **one** action — `1-8`, `1,3,5-7`, etc. Only the keys whose state differs are actuated. This is the clean way to build a "focus mute" shortcut: firing it twice still leaves everything muted, and the Unmuted variant restores exactly. Requires _Monitor mute state_.
 
+> **Every key action, feedback and variable is scoped to a panel.** Pick **Master Panel (Panel 0)** or an attached **Expansion Panel 1–4**. Mute state and volume are decoded per panel, so an expansion panel's keys read back exactly like the master's.
+
 > **Why state-aware matters:** _Toggle Mute on Key_ fires blind — if a key is already muted, a toggle **unmutes** it. The state-aware actions read the panel first, so "mute these 8" always ends with those 8 muted regardless of where they started.
 
 > **The batch actions act on every key at once.** _Set Mute on Multiple Keys_ and _Restore Mute State_ press all the keys they need to change together, hold once, then release together — so a set of eight lands in one go rather than rippling across the panel. Stacking eight individual _Set Key Mute_ actions on a button behaves the same way, but the batch action does it over a single connection.
 
 ### Capture & Restore (undo)
 
-- **Capture Mute State (snapshot)**: Records which keys are currently muted under a snapshot name. Leave _Keys_ empty to capture every key whose state is known, or scope it (`1-8`).
-- **Restore Mute State (undo)**: Puts every key in the snapshot back to the state it had when captured. Only keys that have since changed are actuated, so pressing it twice is harmless.
+- **Capture Mute State (snapshot)**: Records which keys are currently muted under a snapshot name, for the chosen panel. Leave _Keys_ empty to capture every key whose state is known, or scope it (`1-8`). Capturing a **different** panel into the same snapshot name adds it alongside — so one snapshot can cover the master and its expansion panels, and a single Restore puts them all back.
+- **Restore Mute State (undo)**: Puts every key in the snapshot back to the state it had when captured, across every panel the snapshot covers. Each panel's keys are actuated in one batch. Only keys that have since changed are actuated, so pressing it twice is harmless.
 - **Clear Mute Snapshot**: Discards a snapshot.
 
 A typical "focus" button pair:
@@ -206,6 +208,22 @@ The panel exposes **no mute field** anywhere in its API — but it _renders_ a r
 | `mute_snapshot_last`           | Name of the most recently captured snapshot                         |
 | `mute_snapshot_last_muted`     | Keys that were muted in that snapshot                               |
 | `mute_snapshot_last_size`      | How many keys that snapshot covers                                  |
+
+### Per-panel key variables
+
+Key state exists once per panel. The **master panel has no prefix**, so existing buttons keep working unchanged; **expansion panels use `p<N>_`**:
+
+| Variable                      | Description                                        |
+| ----------------------------- | -------------------------------------------------- |
+| `key_5_muted`                 | Master panel, key 5 muted (`true`/`false`)         |
+| `key_5_volume`                | Master panel, key 5 volume (0–100, empty if unassigned) |
+| `muted_keys` / `muted_count`  | Master panel summary                               |
+| `volume_levels`               | Master panel `key:percent,...`                     |
+| `p2_key_5_muted`              | **Expansion Panel 2**, key 5 muted                 |
+| `p2_muted_keys`               | Expansion Panel 2 summary                          |
+| `panels` / `panel_count`      | Which panels were detected                         |
+
+Variables for an expansion panel appear once that panel is detected — the module asks the device which panels are attached when it connects.
 
 ## Network Interfaces
 
