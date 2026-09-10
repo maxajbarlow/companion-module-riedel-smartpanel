@@ -365,29 +365,21 @@ export function getActions(instance: RiedelRSP1232HLInstance): CompanionActionDe
 		},
 		flashIdentify: {
 			name: 'Flash Identify',
-			description: 'Flash the panel identify LEDs a specific number of times (always ends with identify off)',
+			description:
+				'Show an exact number of identify blinks, then turn identify off. The blink rate (~1.7/s) is fixed by the panel itself; the module counts the blinks live and stops after the requested number.',
 			options: [
 				{
 					type: 'number',
 					label: 'Number of Flashes',
 					id: 'count',
-					default: 2,
+					default: 3,
 					min: 1,
 					max: 20,
-				},
-				{
-					type: 'number',
-					label: 'Flash On/Off Time (ms)',
-					id: 'intervalMs',
-					default: 400,
-					min: 50,
-					max: 5000,
 				},
 			],
 			callback: async (action) => {
 				const count = action.options.count as number
-				const intervalMs = action.options.intervalMs as number
-				await instance.flashIdentify(count, intervalMs)
+				await instance.flashIdentify(count)
 			},
 		},
 
@@ -439,7 +431,7 @@ export function getActions(instance: RiedelRSP1232HLInstance): CompanionActionDe
 		flashIdentifyAtIp: {
 			name: 'Flash Identify (Custom IP)',
 			description:
-				'Flash identify LEDs a specific number of times on a panel at a specific IP (always ends with identify off) - supports variables, no dedicated connection needed',
+				'Show an exact number of identify blinks on a panel at a specific IP, then turn identify off. The blink rate (~1.7/s) is fixed by the panel itself; the module counts the blinks live and stops after the requested number. Supports variables, no dedicated connection needed.',
 			options: [
 				{
 					type: 'textinput',
@@ -452,17 +444,9 @@ export function getActions(instance: RiedelRSP1232HLInstance): CompanionActionDe
 					type: 'number',
 					label: 'Number of Flashes',
 					id: 'count',
-					default: 2,
+					default: 3,
 					min: 1,
 					max: 20,
-				},
-				{
-					type: 'number',
-					label: 'Flash On/Off Time (ms)',
-					id: 'intervalMs',
-					default: 400,
-					min: 50,
-					max: 5000,
 				},
 			],
 			callback: async (action) => {
@@ -472,8 +456,7 @@ export function getActions(instance: RiedelRSP1232HLInstance): CompanionActionDe
 					return
 				}
 				const count = action.options.count as number
-				const intervalMs = action.options.intervalMs as number
-				await instance.flashIdentifyAtIp(ip, count, intervalMs)
+				await instance.flashIdentifyAtIp(ip, count)
 			},
 		},
 
@@ -860,6 +843,17 @@ export function getActions(instance: RiedelRSP1232HLInstance): CompanionActionDe
 					(await context.parseVariablesInString(String(action.options.slot ?? 'default'))).trim() || 'default'
 				const existed = instance.clearMuteSnapshot(slot)
 				instance.log('info', `Clear Mute Snapshot: "${slot}" ${existed ? 'cleared' : 'did not exist'}`)
+			},
+		},
+
+		discoverArtistAddress: {
+			name: 'Discover Artist Address (RRCS)',
+			description:
+				"Look this panel up in Artist by name and save its Node/Port into this connection's config, so the RRCS actions know where to send. Runs automatically the first time if the address is blank; use this to re-run it after the panel is renamed or moved. Pulls the whole Artist port list, so it takes a few seconds - it is not something to put on a hot button.",
+			options: [],
+			callback: async () => {
+				const result = await instance.discoverArtistAddress()
+				instance.log(result.ok ? 'info' : 'warn', result.message)
 			},
 		},
 

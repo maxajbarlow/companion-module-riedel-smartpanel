@@ -88,7 +88,7 @@ export function getConfigFields(): SomeCompanionConfigField[] {
 			width: 12,
 			label: 'Artist / RRCS (optional)',
 			value:
-				'Fill this in only if you need to mute keys on a shift page the panel is not displaying. Find Node/Port in Director, or via the RRCS method GetAllPorts (match on the panel name).',
+				'Fill this in only if you need to mute keys on a shift page the panel is not displaying. Set the host and leave Node/Port at 0: the module looks this panel up in Artist by name on first connect and fills them in. The "Discover Artist Address" action re-runs that if the panel is renamed.',
 		},
 		{
 			type: 'textinput',
@@ -109,7 +109,7 @@ export function getConfigFields(): SomeCompanionConfigField[] {
 		{
 			type: 'number',
 			id: 'artistNode',
-			label: "This panel's Artist Node address",
+			label: "This panel's Artist Node address (0 = discover automatically)",
 			width: 6,
 			default: 0,
 			min: 0,
@@ -119,7 +119,7 @@ export function getConfigFields(): SomeCompanionConfigField[] {
 		{
 			type: 'number',
 			id: 'artistPort',
-			label: "This panel's Artist Port address",
+			label: "This panel's Artist Port address (0 = discover automatically)",
 			width: 6,
 			default: 0,
 			min: 0,

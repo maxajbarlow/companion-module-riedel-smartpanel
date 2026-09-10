@@ -103,9 +103,13 @@ Everything above works on the **currently displayed shift page** only, because i
 | --- | --- |
 | RRCS Host | the Artist gateway running RRCS (leave blank to disable the feature entirely) |
 | RRCS Port | usually `8193` |
-| Artist Node / Artist Port | **this panel's** address in Artist |
+| Artist Node / Artist Port | **leave at 0** - see below |
 
-To find Node/Port, look the panel up in Director, or call the RRCS method `GetAllPorts` and match on the panel name - the reply carries `Node`, `Port`, `KeyCount` and `PageCount` for every port in the system.
+**You should not need to type Node/Port.** Set the host, leave both at `0`, and on the next connect the module looks this panel up in Artist **by name** and saves the address into the connection. It needs _Monitor key presses_ enabled, since that is how the panel reports its name.
+
+For this to work the panel's name in Artist must match the name the panel reports for itself. If it does not, the log says so and you can either rename it in Director or set Node/Port by hand.
+
+Use the **Discover Artist Address (RRCS)** action to re-run the lookup after renaming or moving a panel. It reads the entire Artist port list, so it takes a few seconds - run it when convenient, not from a hot button.
 
 ### Volume (ganged trim)
 

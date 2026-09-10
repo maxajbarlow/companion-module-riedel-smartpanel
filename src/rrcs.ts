@@ -56,8 +56,12 @@ function parseErrorCode(xml: string): number {
 // Node's http rather than fetch: this module supports Node >=18, where fetch is
 // still flagged experimental.
 async function call(target: RrcsTarget, method: string, params: RrcsParam[], timeoutMs = 5000): Promise<number> {
+	return parseErrorCode(await callRaw(target, method, params, timeoutMs))
+}
+
+async function callRaw(target: RrcsTarget, method: string, params: RrcsParam[], timeoutMs = 5000): Promise<string> {
 	const payload = buildCall(method, params)
-	return new Promise<number>((resolve, reject) => {
+	return new Promise<string>((resolve, reject) => {
 		const req = request(
 			{
 				host: target.host,
@@ -82,11 +86,7 @@ async function call(target: RrcsTarget, method: string, params: RrcsParam[], tim
 						reject(new Error(`HTTP ${res.statusCode}`))
 						return
 					}
-					try {
-						resolve(parseErrorCode(body))
-					} catch (error) {
-						reject(error instanceof Error ? error : new Error(String(error)))
-					}
+					resolve(body)
 				})
 			},
 		)
@@ -129,6 +129,39 @@ export async function pressKeyMomentary(
 	} finally {
 		await call(target, 'PressKeyEx', args(false)).catch(() => undefined)
 	}
+}
+
+/**
+ * Look a panel up in Artist by name and return its Node/Port address.
+ *
+ * `GetAllPorts` is the only call that maps a name to an address - GetObjectList
+ * is far smaller but returns just {LongName, ObjectID}, and port objects do not
+ * expose Node/Port as properties. The reply is large (~5 MB on a full system),
+ * so this is meant to be run ONCE and the result saved, never on every startup.
+ *
+ * Only three members per port are needed, so the response is scanned rather than
+ * fully parsed - a real XML parse of 5 MB would cost far more than it buys.
+ */
+export async function findPortByName(
+	target: RrcsTarget,
+	name: string,
+	timeoutMs = 20000,
+): Promise<{ node: number; port: number; matchedName: string } | undefined> {
+	const xml = await callRaw(target, 'GetAllPorts', [TRANS_KEY], timeoutMs)
+	const wanted = name.trim().toLowerCase()
+	if (!wanted) return undefined
+
+	for (const chunk of xml.split('<struct>')) {
+		const member = (field: string): string | undefined =>
+			new RegExp(`<name>${field}</name>\\s*<value>(?:<(?:string|i4|int)>)?([^<]*)`, 'i').exec(chunk)?.[1]
+		const candidates = [member('Name'), member('LongName')].filter((v): v is string => v !== undefined)
+		if (!candidates.some((c) => c.trim().toLowerCase() === wanted)) continue
+		const node = member('Node')
+		const port = member('Port')
+		if (node === undefined || port === undefined) continue
+		return { node: parseInt(node, 10), port: parseInt(port, 10), matchedName: candidates[0].trim() }
+	}
+	return undefined
 }
 
 /** Human-readable meaning for the RRCS error codes we are likely to hit. */

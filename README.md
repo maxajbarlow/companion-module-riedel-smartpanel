@@ -108,9 +108,13 @@ Prefer the state-aware action whenever the key is on the displayed page.
 | --- | --- |
 | RRCS Host | Artist gateway running RRCS. Leave blank to disable the feature |
 | RRCS Port | usually `8193` |
-| Artist Node / Artist Port | this panel's address in Artist |
+| Artist Node / Artist Port | **leave at 0** and let the module discover them |
 
-Find Node/Port in Director, or call the RRCS method `GetAllPorts` and match on the panel name; the reply includes `Node`, `Port`, `KeyCount` and `PageCount` for every port.
+**Node/Port are discovered automatically.** Set the RRCS host, leave both addresses at `0`, and on the next connect the module looks the panel up in Artist **by name** and saves what it finds into the connection - so it happens once, not on every restart. This needs _Monitor key presses_ enabled, because that is how the panel reports its own name.
+
+The panel's Artist name must match the name the panel reports for itself. If it does not, the log says so; rename it in Director or fill the addresses in by hand.
+
+Re-run the lookup with the **Discover Artist Address (RRCS)** action after renaming or re-patching a panel. It downloads the full Artist port list (several MB on a large system) and takes a few seconds, which is exactly why it is a one-off rather than something done at startup.
 
 ## Targeting Multiple Panels Without a Dedicated Connection
 
