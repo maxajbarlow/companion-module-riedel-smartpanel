@@ -13,6 +13,8 @@ import { getVariableDefinitions, getDefaultVariableValues } from './variables.js
 import WebSocket from 'ws'
 import * as jpeg from 'jpeg-js'
 import { parseKeySpec } from './keys.js'
+import { variablePrefix, ALL_PANEL_IDS } from './panels.js'
+import { findPortByName } from './rrcs.js'
 
 interface NetworkTarget {
 	ip: string
@@ -59,6 +61,10 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 	private interfaceLinkStatuses: Map<string, string> = new Map()
 	private networkSettings: NetworkSettings | null = null
 	public identifyEnabled = false
+	// Cancellation generations for in-flight identify flash sequences, keyed by
+	// target ('local' for the primary connection, host IP for remote panels).
+	// Bumping a key's generation cancels any flash loop running against it.
+	private identifyFlashGens: Map<string, number> = new Map()
 	public artistConnectionStatus = 'Unknown'
 	public healthStatus = 'Unknown'
 	private alarmList: unknown[] = []
@@ -94,11 +100,17 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 	// pushes an updated JPEG whenever a key's rendering changes (including mute). We
 	// decode the glyph region per key to recover true mute state, which lets the
 	// Set Key Mute actions be idempotent instead of blindly toggling.
-	// Master panel (panelId 0) only: the binary display frames carry a display index
-	// but no panelId, so we cannot attribute pushed frames to expansion panels.
-	private mutedKeys: Map<number, boolean> = new Map() // 0-based keyId -> muted
+	// Display frames are per panel: the binary header is
+	//   uint8 panelId | uint8 displayId | uint16 mimeLen | mime | JPEG
+	// so an expansion panel's keys are recoverable too, keyed `${panelId}:${keyId}`.
+	private mutedKeys: Map<string, boolean> = new Map() // `${panelId}:${keyId}` -> muted
 	private static readonly MUTE_GRID_COLS = 8
-	private static readonly MUTE_GRID_ROWS = 2
+	// Key cells are a fixed physical size, but the number of ROWS per keybank display
+	// depends on the panel type: the 32-key master (RSP-1232HL) draws 8x2 cells per
+	// display (1284x248), while a 16-key expansion panel (ESP-1216HL) draws 8x1
+	// (1284x130). Rows are therefore derived from the frame height - hardcoding 2
+	// puts every expansion key on display 1 out by +8 (key 9 decoded as key 17).
+	private static readonly KEY_CELL_HEIGHT = 130
 	private static readonly MUTE_RED_THRESHOLD = 0.02
 
 	// --- Per-key volume, decoded from the same rendered key displays ---
@@ -107,7 +119,7 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 	// delta that reads 0 at rest, not a position), so the rendered bar is the only
 	// way to recover an absolute level. We take the rightmost bright pixel on the
 	// bar row as the fill extent. An unassigned key draws no bar at all -> undefined.
-	private volumeLevels: Map<number, number> = new Map() // 0-based keyId -> 0..1
+	private volumeLevels: Map<string, number> = new Map() // `${panelId}:${keyId}` -> 0..1
 	private static readonly VOLUME_BAR_TOP = 0.66
 	private static readonly VOLUME_BAR_BOTTOM = 0.74
 	private static readonly VOLUME_BAR_BRIGHT = 90
@@ -118,15 +130,27 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 	// slot name -> (1-based keyNumber -> was muted). Held in memory only: a snapshot
 	// is a within-session undo point and is intentionally not persisted across a
 	// Companion restart.
-	private muteSnapshots: Map<string, Map<number, boolean>> = new Map()
+	private muteSnapshots: Map<string, Map<string, boolean>> = new Map()
 	private lastSnapshotSlot = ''
+
+	// Panels present on this device, learned from FetchPanelInfo on the live-view
+	// socket. Master is always 0; expansion panels appear as 1-4 when attached.
+	// Used to request display content per panel and to define per-panel variables.
+	private knownPanels: number[] = [0]
+
+	// The panel's own name, as Artist knows it. Used to look this panel up in
+	// Artist so the RRCS node/port do not have to be typed in by hand.
+	private panelCustomName = ''
+	// Discovery pulls the whole Artist port list (~5 MB), so it runs at most once
+	// per session and only when the address is not already known.
+	private artistDiscoveryDone = false
 
 	// Last values actually pushed to Companion, so we only send what changed.
 	// Every variable write crosses the IPC boundary into the shared Companion
 	// process; a fleet of panels all re-sending 64 unchanged values on every
 	// display frame adds up there, even though each module runs in its own process.
-	private publishedMute: Map<number, string> = new Map()
-	private publishedVolume: Map<number, string> = new Map()
+	private publishedMute: Map<string, string> = new Map()
+	private publishedVolume: Map<string, string> = new Map()
 
 	constructor(internal: unknown) {
 		super(internal)
@@ -153,6 +177,7 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 	}
 
 	async destroy(): Promise<void> {
+		this.cancelAllIdentifyFlashes()
 		this.stopPingTimer()
 		if (this.reconnectTimer) {
 			clearTimeout(this.reconnectTimer)
@@ -166,6 +191,7 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 	}
 
 	async configUpdated(config: DeviceConfig): Promise<void> {
+		this.cancelAllIdentifyFlashes()
 		this.config = config
 		this.stopPingTimer()
 		if (this.ws) {
@@ -345,9 +371,15 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 				// Subscribing makes the panel push key events *and* an updated display
 				// image whenever a key's rendering changes (including mute).
 				this.sendLiveView('/LiveView/SubscribePanelEvents', { panelId: 0 })
+				// Ask which panels are actually attached, so we only define variables
+				// and request displays for panels that exist.
+				this.sendLiveView('/LiveView/FetchPanelInfo', {})
 				if (this.config.enableMuteState === true) {
-					// One-shot snapshot so mute state is known before anything changes.
-					this.sendLiveView('/LiveView/RequestDisplayContent', { panelId: 0 })
+					// One-shot snapshot per panel so state is known before anything changes.
+					// Requesting a panel that is not attached simply returns nothing.
+					for (const panelId of ALL_PANEL_IDS) {
+						this.sendLiveView('/LiveView/RequestDisplayContent', { panelId })
+					}
 				}
 			})
 			this.liveViewWs.on('message', (data: WebSocket.Data, isBinary: boolean) => {
@@ -410,18 +442,24 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 		}
 	}
 
-	// Decode a pushed display frame and recover per-key mute state.
-	// Frame layout: uint16 displayIndex | uint16 mimeLen | mime | <image bytes>
+	// Decode a pushed display frame and recover per-key mute state and volume.
+	// Frame layout: uint8 panelId | uint8 displayId | uint16 mimeLen | mime | <image bytes>
 	// Display 0 = keys 1-16, display 1 = keys 17-32 (8 cols x 2 rows each).
 	// Display 2 is the centre info screen and carries no key cells.
+	// panelId identifies which panel the frame came from, so expansion panels
+	// (1-4) decode exactly like the master. Reading the first two bytes as one
+	// uint16 happens to work for the master panel only, because panelId 0 leaves
+	// the value equal to displayId - every expansion frame would be discarded.
 	private handleDisplayFrame(buf: Buffer): void {
 		if (buf.length < 6) return
-		const displayIndex = buf.readUInt16BE(0)
+		const panelId = buf.readUInt8(0)
+		const displayId = buf.readUInt8(1)
 		const mimeLen = buf.readUInt16BE(2)
 		if (buf.length < 4 + mimeLen) return
 		const mime = buf.subarray(4, 4 + mimeLen).toString('ascii')
 		if (!mime.includes('jp')) return // image/jpg or image/jpeg
-		if (displayIndex !== 0 && displayIndex !== 1) return // keybank displays only
+		if (displayId !== 0 && displayId !== 1) return // keybank displays only
+		this.notePanelSeen(panelId)
 		const payload = buf.subarray(4 + mimeLen)
 		let img: jpeg.RawImageData<Uint8Array>
 		try {
@@ -431,10 +469,12 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 			return
 		}
 		const cols = RiedelRSP1232HLInstance.MUTE_GRID_COLS
-		const rows = RiedelRSP1232HLInstance.MUTE_GRID_ROWS
+		const rows = Math.max(1, Math.round(img.height / RiedelRSP1232HLInstance.KEY_CELL_HEIGHT))
 		const cw = img.width / cols
 		const ch = img.height / rows
-		const baseKey = displayIndex * cols * rows
+		// Keys per display follows the grid, so display 1 starts at key 17 on the
+		// master (8x2) but at key 9 on an expansion panel (8x1).
+		const baseKey = displayId * cols * rows
 		let changed = false
 		let volumeChanged = false
 		for (let row = 0; row < rows; row++) {
@@ -451,18 +491,19 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 					Math.floor(y0 + ch * 0.3),
 				)
 				const muted = frac > RiedelRSP1232HLInstance.MUTE_RED_THRESHOLD
-				if (this.mutedKeys.get(keyId) !== muted) changed = true
-				this.mutedKeys.set(keyId, muted)
+				const slot = `${panelId}:${keyId}`
+				if (this.mutedKeys.get(slot) !== muted) changed = true
+				this.mutedKeys.set(slot, muted)
 
 				const level = this.barFraction(img, x0, y0, cw, ch)
-				const previous = this.volumeLevels.get(keyId)
+				const previous = this.volumeLevels.get(slot)
 				if (level === undefined) {
 					if (previous !== undefined) {
-						this.volumeLevels.delete(keyId)
+						this.volumeLevels.delete(slot)
 						volumeChanged = true
 					}
 				} else if (previous === undefined || Math.abs(previous - level) > RiedelRSP1232HLInstance.VOLUME_EPSILON) {
-					this.volumeLevels.set(keyId, level)
+					this.volumeLevels.set(slot, level)
 					volumeChanged = true
 				}
 			}
@@ -525,35 +566,43 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 
 	private publishVolumeState(): void {
 		const values: CompanionVariableValues = {}
-		const summary: string[] = []
-		for (let keyId = 0; keyId < 32; keyId++) {
-			const level = this.volumeLevels.get(keyId)
-			const text = level === undefined ? '' : String(Math.round(level * 100))
-			if (this.publishedVolume.get(keyId) !== text) {
-				values[`key_${keyId + 1}_volume`] = text
-				this.publishedVolume.set(keyId, text)
+		for (const panelId of this.knownPanels) {
+			const prefix = variablePrefix(panelId)
+			const summary: string[] = []
+			for (let keyId = 0; keyId < 32; keyId++) {
+				const slot = `${panelId}:${keyId}`
+				const level = this.volumeLevels.get(slot)
+				const text = level === undefined ? '' : String(Math.round(level * 100))
+				if (this.publishedVolume.get(slot) !== text) {
+					values[`${prefix}key_${keyId + 1}_volume`] = text
+					this.publishedVolume.set(slot, text)
+				}
+				if (text !== '') summary.push(`${keyId + 1}:${text}`)
 			}
-			if (text !== '') summary.push(`${keyId + 1}:${text}`)
+			values[`${prefix}volume_levels`] = summary.join(',')
 		}
-		values.volume_levels = summary.join(',')
 		this.setVariableValues(values)
 		this.checkFeedbacks('keyVolume')
 	}
 
 	private publishMuteState(): void {
 		const values: CompanionVariableValues = {}
-		const mutedList: number[] = []
-		for (let keyId = 0; keyId < 32; keyId++) {
-			const muted = this.mutedKeys.get(keyId)
-			const text = muted === undefined ? '' : muted ? 'true' : 'false'
-			if (this.publishedMute.get(keyId) !== text) {
-				values[`key_${keyId + 1}_muted`] = text
-				this.publishedMute.set(keyId, text)
+		for (const panelId of this.knownPanels) {
+			const prefix = variablePrefix(panelId)
+			const mutedList: number[] = []
+			for (let keyId = 0; keyId < 32; keyId++) {
+				const slot = `${panelId}:${keyId}`
+				const muted = this.mutedKeys.get(slot)
+				const text = muted === undefined ? '' : muted ? 'true' : 'false'
+				if (this.publishedMute.get(slot) !== text) {
+					values[`${prefix}key_${keyId + 1}_muted`] = text
+					this.publishedMute.set(slot, text)
+				}
+				if (muted) mutedList.push(keyId + 1)
 			}
-			if (muted) mutedList.push(keyId + 1)
+			values[`${prefix}muted_keys`] = mutedList.join(',')
+			values[`${prefix}muted_count`] = String(mutedList.length)
 		}
-		values.muted_keys = mutedList.join(',')
-		values.muted_count = String(mutedList.length)
 		this.setVariableValues(values)
 		// A restore button's "differs from snapshot" styling depends on live mute state.
 		this.checkFeedbacks('keyMuted', 'muteSnapshotDiffers')
@@ -592,6 +641,28 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 				last_button_state: buttonState,
 			})
 			this.checkFeedbacks('keyButtonState')
+		} else if (topic === '/LiveView/FetchPanelInfoResponse') {
+			// { panels: [{ panelId, panelType, customName, firmwareVersion }, ...] }
+			const panels = Array.isArray(body.panels) ? body.panels : []
+			const ids = panels
+				.map((p) => (typeof p === 'object' && p !== null ? Number((p as Record<string, unknown>).panelId) : NaN))
+				.filter((id) => Number.isInteger(id) && id >= 0)
+			const master = panels.find(
+				(p) => typeof p === 'object' && p !== null && Number((p as Record<string, unknown>).panelId) === 0,
+			) as Record<string, unknown> | undefined
+			if (typeof master?.customName === 'string' && master.customName) {
+				this.panelCustomName = master.customName
+				// Now that the panel's name is known, fill in its Artist address if
+				// it has not been set. Best-effort: a failure just logs.
+				void this.autoDiscoverArtistAddress()
+			}
+			if (ids.length > 0) {
+				const merged = [...new Set([0, ...ids])].sort((a, b) => a - b)
+				if (merged.join(',') !== this.knownPanels.join(',')) {
+					this.knownPanels = merged
+					this.refreshPanelVariables()
+				}
+			}
 		} else if (topic === '/LiveView/LeverKeyRotaryTurned') {
 			const panelId = Number(body.panelId ?? 0)
 			const keyId = Number(body.keyId)
@@ -1152,15 +1223,47 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 	}
 
 	// Identify methods
-	// Note: the panel has no built-in "flash count" parameter - /Identify only exposes
-	// a bare on/off latch. Empirically, each Enable/Disable message is itself one visible
-	// flash of the panel's key LEDs (it is not "Enable starts blinking, Disable stops it").
-	// flashIdentify() below reproduces a specific flash count by alternating the latch.
+	// /Identify only exposes a bare on/off latch: Enable starts the panel's identify
+	// blinking and it keeps blinking until a Disable arrives. Measured on hardware:
+	// the blink itself is generated by the panel on its own free-running ~600ms clock
+	// (~300ms lit / ~300ms dark, all key LED rings together, white overlay vs black),
+	// so an Enable can land anywhere in that cycle - the first blink after Enable may
+	// be a truncated "runt" (observed as short as 51ms). Synthesizing flashes with
+	// timed Enable/Disable windows therefore produces a random-looking result.
+	//
+	// flashIdentify() instead enables ONCE and counts the panel's own blink edges,
+	// which the panel broadcasts to every /live-view client as
+	// LeverKeyLedRingStateChanged (no subscription needed): a full blink = a lit
+	// phase >= IDENTIFY_MIN_FULL_BLINK_MS (runts are ignored), and Disable is sent in
+	// the dark phase right after the Nth full blink. If no edges arrive (unexpected
+	// firmware) it falls back to a duration based on the measured cycle. Every
+	// identify action bumps the target's flash generation, cancelling any in-flight
+	// flash - so "Disable Identify" doubles as a stop button.
+	private static readonly IDENTIFY_MIN_FULL_BLINK_MS = 150
+	private static readonly IDENTIFY_BLINK_CYCLE_MS = 600
+	private static readonly IDENTIFY_NO_EDGE_FALLBACK_MS = 2000
+	private bumpIdentifyFlashGen(key: string): number {
+		const gen = (this.identifyFlashGens.get(key) ?? 0) + 1
+		this.identifyFlashGens.set(key, gen)
+		return gen
+	}
+
+	private isIdentifyFlashCurrent(key: string, gen: number): boolean {
+		return this.identifyFlashGens.get(key) === gen
+	}
+
+	private cancelAllIdentifyFlashes(): void {
+		for (const key of this.identifyFlashGens.keys()) {
+			this.bumpIdentifyFlashGen(key)
+		}
+	}
+
 	public fetchIdentifyStatus(): void {
 		this.sendMessage('/Identify/FetchStatus', {})
 	}
 
 	public enableIdentify(): void {
+		this.bumpIdentifyFlashGen('local')
 		this.sendMessage('/Identify/Enable', {})
 		this.identifyEnabled = true
 		this.setVariableValues({ identify_status: 'Active' })
@@ -1168,6 +1271,7 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 	}
 
 	public disableIdentify(): void {
+		this.bumpIdentifyFlashGen('local')
 		this.sendMessage('/Identify/Disable', {})
 		this.identifyEnabled = false
 		this.setVariableValues({ identify_status: 'Inactive' })
@@ -1182,19 +1286,129 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 		}
 	}
 
-	public async flashIdentify(count: number, intervalMs: number): Promise<void> {
-		if (count < 1) return
-		let state = this.identifyEnabled
-		for (let i = 0; i < count; i++) {
-			state = !state
-			this.sendMessage(state ? '/Identify/Enable' : '/Identify/Disable', {})
-			this.identifyEnabled = state
-			if (i < count - 1) {
-				await new Promise((resolve) => setTimeout(resolve, intervalMs))
+	// Watch the panel's identify blink on a short-lived /live-view socket and
+	// resolve after the Nth FULL blink completes (we are then in the dark phase).
+	// onReady fires once the watch socket is OPEN - the caller must send the
+	// Enable there, not before: enabling first races the socket handshake and the
+	// watcher misses the first blink's lit edge, over-counting by one (seen on
+	// hardware). If the socket never opens, onReady fires on the fallback path.
+	// Resolves 'counted' on success, 'fallback' when edges are unavailable (caller
+	// should hold identify for a duration instead), 'cancelled' when a newer
+	// identify action superseded this flash.
+	private async watchIdentifyBlinks(
+		host: string,
+		port: number,
+		count: number,
+		isCurrent: () => boolean,
+		onReady: () => void,
+	): Promise<'counted' | 'fallback' | 'cancelled'> {
+		return new Promise((resolve) => {
+			let watch: WebSocket
+			try {
+				watch = new WebSocket(`ws://${host}:${port}/live-view`)
+			} catch {
+				resolve('fallback')
+				return
 			}
+			let fullBlinks = 0
+			let litSince = 0
+			let sawEdge = false
+			let settled = false
+			let noEdgeFallback: ReturnType<typeof setTimeout> | undefined
+			const settle = (result: 'counted' | 'fallback' | 'cancelled') => {
+				if (settled) return
+				settled = true
+				clearTimeout(hardCap)
+				if (noEdgeFallback) clearTimeout(noEdgeFallback)
+				clearInterval(cancelPoll)
+				try {
+					watch.close()
+				} catch {
+					// already closed
+				}
+				resolve(result)
+			}
+			const hardCap = setTimeout(
+				() => settle('fallback'),
+				count * 1.5 * RiedelRSP1232HLInstance.IDENTIFY_BLINK_CYCLE_MS + 6000,
+			)
+			const cancelPoll = setInterval(() => {
+				if (!isCurrent()) settle('cancelled')
+			}, 100)
+			watch.on('open', () => {
+				onReady()
+				noEdgeFallback = setTimeout(() => {
+					if (!sawEdge) settle('fallback')
+				}, RiedelRSP1232HLInstance.IDENTIFY_NO_EDGE_FALLBACK_MS)
+			})
+			watch.on('error', () => settle('fallback'))
+			watch.on('close', () => settle('fallback'))
+			watch.on('message', (raw: WebSocket.Data, isBinary: boolean) => {
+				if (isBinary) return
+				const buf = Buffer.isBuffer(raw)
+					? raw
+					: Array.isArray(raw)
+						? Buffer.concat(raw)
+						: typeof raw === 'string'
+							? Buffer.from(raw, 'utf8')
+							: Buffer.from(raw)
+				let data: { topic?: string; body?: Record<string, unknown> }
+				try {
+					data = JSON.parse(buf.toString('utf8'))
+				} catch {
+					return
+				}
+				if (!data.topic?.endsWith('LeverKeyLedRingStateChanged')) return
+				const body = data.body ?? {}
+				// All keys blink together - key 0 on the master panel is our clock.
+				if (body.keyId !== 0 || body.panelId !== 0) return
+				sawEdge = true
+				const color = (body.upperColor ?? {}) as { red?: number; green?: number; blue?: number }
+				const lit = (color.red ?? 0) + (color.green ?? 0) + (color.blue ?? 0) > 0
+				const now = Date.now()
+				if (lit) {
+					litSince = now
+				} else if (litSince > 0) {
+					if (now - litSince >= RiedelRSP1232HLInstance.IDENTIFY_MIN_FULL_BLINK_MS) {
+						fullBlinks++
+						if (fullBlinks >= count) settle('counted')
+					}
+					litSince = 0
+				}
+			})
+		})
+	}
+
+	public async flashIdentify(count: number): Promise<void> {
+		if (count < 1) return
+		const gen = this.bumpIdentifyFlashGen('local')
+		const isCurrent = () => this.isIdentifyFlashCurrent('local', gen)
+		let enabledAt = 0
+		const enable = () => {
+			if (enabledAt) return
+			enabledAt = Date.now()
+			this.sendMessage('/Identify/Enable', {})
+			this.identifyEnabled = true
+			this.setVariableValues({ identify_status: 'Active' })
+			this.checkFeedbacks('identifyEnabled')
 		}
-		this.setVariableValues({ identify_status: this.identifyEnabled ? 'Active' : 'Inactive' })
-		this.checkFeedbacks('identifyEnabled')
+		const target = this.parseIpAndPort()
+		const result = target?.ip
+			? await this.watchIdentifyBlinks(target.ip, target.port ?? 80, count, isCurrent, enable)
+			: 'fallback'
+		if (result === 'fallback') {
+			// Watcher unavailable (or it never opened): enable now and hold for a duration.
+			enable()
+			const remaining = (count - 0.5) * RiedelRSP1232HLInstance.IDENTIFY_BLINK_CYCLE_MS - (Date.now() - enabledAt)
+			if (remaining > 0) await new Promise((resolve) => setTimeout(resolve, remaining))
+		}
+		// 'cancelled' means a newer identify action owns the latch now - leave it be.
+		if (isCurrent()) {
+			this.sendMessage('/Identify/Disable', {})
+			this.identifyEnabled = false
+			this.setVariableValues({ identify_status: 'Inactive' })
+			this.checkFeedbacks('identifyEnabled')
+		}
 	}
 
 	// Identify-by-IP methods
@@ -1236,28 +1450,37 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 	}
 
 	public async enableIdentifyAtIp(host: string): Promise<void> {
+		this.bumpIdentifyFlashGen(host)
 		await this.runIdentifyOnRemote(host, async (send) => {
 			send('/Identify/Enable')
 		})
 	}
 
 	public async disableIdentifyAtIp(host: string): Promise<void> {
+		this.bumpIdentifyFlashGen(host)
 		await this.runIdentifyOnRemote(host, async (send) => {
 			send('/Identify/Disable')
 		})
 	}
 
-	public async flashIdentifyAtIp(host: string, count: number, intervalMs: number): Promise<void> {
+	public async flashIdentifyAtIp(host: string, count: number): Promise<void> {
 		if (count < 1) return
+		const gen = this.bumpIdentifyFlashGen(host)
+		const isCurrent = () => this.isIdentifyFlashCurrent(host, gen)
 		await this.runIdentifyOnRemote(host, async (send) => {
-			let state = false
-			for (let i = 0; i < count; i++) {
-				state = !state
-				send(state ? '/Identify/Enable' : '/Identify/Disable')
-				if (i < count - 1) {
-					await new Promise((resolve) => setTimeout(resolve, intervalMs))
-				}
+			let enabledAt = 0
+			const enable = () => {
+				if (enabledAt) return
+				enabledAt = Date.now()
+				send('/Identify/Enable')
 			}
+			const result = await this.watchIdentifyBlinks(host, this.config.port ?? 80, count, isCurrent, enable)
+			if (result === 'fallback') {
+				enable()
+				const remaining = (count - 0.5) * RiedelRSP1232HLInstance.IDENTIFY_BLINK_CYCLE_MS - (Date.now() - enabledAt)
+				if (remaining > 0) await new Promise((resolve) => setTimeout(resolve, remaining))
+			}
+			if (isCurrent()) send('/Identify/Disable')
 		})
 	}
 
@@ -1386,10 +1609,85 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 		})
 	}
 
+	/**
+	 * Fill in this panel's Artist node/port automatically, once.
+	 *
+	 * Only runs when an RRCS host is configured and the address has not been set,
+	 * because the lookup pulls the entire Artist port list (~5 MB). The result is
+	 * saved back to the connection config, so it happens once and never again -
+	 * a fleet of panels restarting must not each re-download that.
+	 */
+	private async autoDiscoverArtistAddress(): Promise<void> {
+		if (this.artistDiscoveryDone) return
+		const host = String(this.config.rrcsHost ?? '').trim()
+		if (!host) return
+		if (Number(this.config.artistNode ?? 0) || Number(this.config.artistPort ?? 0)) return
+		this.artistDiscoveryDone = true // one attempt per session, success or not
+		const result = await this.discoverArtistAddress()
+		this.log(result.ok ? 'info' : 'warn', result.message)
+	}
+
+	/**
+	 * Look this panel up in Artist by name and store the address it finds.
+	 * Exposed so it can also be re-run on demand from an action.
+	 */
+	public async discoverArtistAddress(): Promise<{ ok: boolean; message: string }> {
+		const host = String(this.config.rrcsHost ?? '').trim()
+		if (!host) return { ok: false, message: 'Discover Artist Address: no RRCS host configured' }
+		const name = this.panelCustomName
+		if (!name) {
+			return {
+				ok: false,
+				message:
+					'Discover Artist Address: the panel has not reported its name yet - enable "Monitor key presses" and try again',
+			}
+		}
+		try {
+			const found = await findPortByName({ host, port: Number(this.config.rrcsPort ?? 8193) }, name)
+			if (!found) {
+				return {
+					ok: false,
+					message: `Discover Artist Address: no Artist port is named "${name}". Set Artist Node/Port by hand, or rename to match.`,
+				}
+			}
+			this.config = { ...this.config, artistNode: found.node, artistPort: found.port }
+			this.saveConfig(this.config)
+			this.artistDiscoveryDone = true
+			return {
+				ok: true,
+				message: `Discover Artist Address: "${found.matchedName}" is Node ${found.node} Port ${found.port} - saved to this connection`,
+			}
+		} catch (error) {
+			return { ok: false, message: `Discover Artist Address failed: ${error}` }
+		}
+	}
+
 	// Getter methods for feedbacks
-	public getKeyVolume(keyNumber: number): number | undefined {
-		const level = this.volumeLevels.get(keyNumber - 1)
+	public getKeyVolume(panelId: number, keyNumber: number): number | undefined {
+		const level = this.volumeLevels.get(`${panelId}:${keyNumber - 1}`)
 		return level === undefined ? undefined : Math.round(level * 100)
+	}
+
+	/** Panels currently known to be attached (always includes the master, 0). */
+	public getKnownPanels(): number[] {
+		return [...this.knownPanels]
+	}
+
+	/**
+	 * Record a panel we have seen traffic from. Display frames name their panel, so
+	 * an expansion panel becomes known even if FetchPanelInfo was missed.
+	 */
+	private notePanelSeen(panelId: number): void {
+		if (this.knownPanels.includes(panelId)) return
+		this.knownPanels = [...this.knownPanels, panelId].sort((a, b) => a - b)
+		this.refreshPanelVariables()
+	}
+
+	/** Redefine variables so newly discovered expansion panels get their own set. */
+	private refreshPanelVariables(): void {
+		this.setVariableDefinitions(getVariableDefinitions(this.knownPanels))
+		this.setVariableValues({ panels: this.knownPanels.join(','), panel_count: String(this.knownPanels.length) })
+		this.log('info', `Panels detected: ${this.knownPanels.join(', ')}`)
 	}
 
 	public isConnected(): boolean {
@@ -1444,10 +1742,10 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 	/**
 	 * True/false if the key's mute state is known, undefined if it isn't yet
 	 * (mute monitoring disabled, key on another shift page, or no snapshot yet).
-	 * Master panel only. keyNumber is 1-based.
+	 * keyNumber is 1-based; panelId 0 is the master, 1-4 expansion panels.
 	 */
-	public getKeyMuted(keyNumber: number): boolean | undefined {
-		return this.mutedKeys.get(keyNumber - 1)
+	public getKeyMuted(panelId: number, keyNumber: number): boolean | undefined {
+		return this.mutedKeys.get(`${panelId}:${keyNumber - 1}`)
 	}
 
 	/**
@@ -1455,18 +1753,27 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 	 * Pass a list of 1-based key numbers, or null for every key whose state is known.
 	 * Keys with unknown state cannot be captured and are reported back to the caller.
 	 */
-	public captureMuteSnapshot(slot: string, keys: number[] | null): { captured: number[]; unknown: number[] } {
+	public captureMuteSnapshot(
+		slot: string,
+		panelId: number,
+		keys: number[] | null,
+	): { captured: number[]; unknown: number[] } {
 		const candidates = keys && keys.length > 0 ? keys : Array.from({ length: 32 }, (_, i) => i + 1)
-		const snapshot = new Map<number, boolean>()
+		// Capturing a different panel into the same slot replaces that panel's entries
+		// but leaves other panels' entries intact, so one slot can span panels.
+		const snapshot = new Map(this.muteSnapshots.get(slot) ?? [])
+		for (const key of [...snapshot.keys()]) {
+			if (key.startsWith(`${panelId}:`)) snapshot.delete(key)
+		}
 		const captured: number[] = []
 		const unknown: number[] = []
 		for (const keyNumber of candidates) {
-			const muted = this.mutedKeys.get(keyNumber - 1)
+			const muted = this.mutedKeys.get(`${panelId}:${keyNumber - 1}`)
 			if (muted === undefined) {
 				unknown.push(keyNumber)
 				continue
 			}
-			snapshot.set(keyNumber, muted)
+			snapshot.set(`${panelId}:${keyNumber}`, muted)
 			captured.push(keyNumber)
 		}
 		if (snapshot.size > 0) {
@@ -1478,8 +1785,8 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 		return { captured, unknown }
 	}
 
-	/** The stored snapshot for a slot: 1-based keyNumber -> was muted. */
-	public getMuteSnapshot(slot: string): Map<number, boolean> | undefined {
+	/** The stored snapshot for a slot: `${panelId}:${keyNumber}` (1-based key) -> was muted. */
+	public getMuteSnapshot(slot: string): Map<string, boolean> | undefined {
 		return this.muteSnapshots.get(slot)
 	}
 
@@ -1501,8 +1808,9 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 	public muteSnapshotDiffers(slot: string): boolean {
 		const snapshot = this.muteSnapshots.get(slot)
 		if (!snapshot) return false
-		for (const [keyNumber, wasMuted] of snapshot) {
-			const current = this.mutedKeys.get(keyNumber - 1)
+		for (const [key, wasMuted] of snapshot) {
+			const [panelPart, keyPart] = key.split(':')
+			const current = this.mutedKeys.get(`${panelPart}:${Number(keyPart) - 1}`)
 			if (current !== undefined && current !== wasMuted) return true
 		}
 		return false
@@ -1510,11 +1818,14 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 
 	private publishSnapshotState(): void {
 		const last = this.muteSnapshots.get(this.lastSnapshotSlot)
+		// `panel:key` for expansion panels, bare key number for the master, so the
+		// common single-panel case reads exactly as it did before.
 		const lastMuted = last
 			? [...last.entries()]
 					.filter(([, muted]) => muted)
-					.map(([keyNumber]) => keyNumber)
-					.sort((a, b) => a - b)
+					.map(([key]) => key)
+					.sort()
+					.map((key) => (key.startsWith('0:') ? key.slice(2) : key))
 			: []
 		this.setVariableValues({
 			mute_snapshot_slots: [...this.muteSnapshots.keys()].join(','),

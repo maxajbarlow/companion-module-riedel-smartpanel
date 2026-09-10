@@ -1,4 +1,5 @@
 import { Regex, type SomeCompanionConfigField } from '@companion-module/base'
+import { PANEL_CHOICES } from './panels.js'
 
 export interface DeviceConfig {
 	bonjourHost?: string
@@ -6,20 +7,16 @@ export interface DeviceConfig {
 	port?: number
 	enableKeyEvents?: boolean
 	enableMuteState?: boolean
+	rrcsHost?: string
+	rrcsPort?: number
+	artistNode?: number
+	artistPort?: number
 	enableRotaryGang?: boolean
 	gangSourcePanel?: number
 	gangSourceKey?: number
 	gangTargetPanel?: number
 	gangTargetKeys?: string
 }
-
-export const PANEL_CHOICES = [
-	{ id: 0, label: 'Master Panel (Panel 0)' },
-	{ id: 1, label: 'Expansion Panel 1 (Panel 1)' },
-	{ id: 2, label: 'Expansion Panel 2 (Panel 2)' },
-	{ id: 3, label: 'Expansion Panel 3 (Panel 3)' },
-	{ id: 4, label: 'Expansion Panel 4 (Panel 4)' },
-]
 
 export function getConfigFields(): SomeCompanionConfigField[] {
 	return [
@@ -80,6 +77,54 @@ export function getConfigFields(): SomeCompanionConfigField[] {
 			width: 12,
 			default: false,
 			isVisible: (options) => options['enableKeyEvents'] === true,
+		},
+		// --- Artist / RRCS (optional) ---
+		// The panel's own API can only reach keys on the page it is currently showing.
+		// RRCS addresses keys by page, so it can mute a key on a page nobody is looking
+		// at. Leave the host blank and none of it is used.
+		{
+			type: 'static-text',
+			id: 'rrcs-info',
+			width: 12,
+			label: 'Artist / RRCS (optional)',
+			value:
+				'Fill this in only if you need to mute keys on a shift page the panel is not displaying. Set the host and leave Node/Port at 0: the module looks this panel up in Artist by name on first connect and fills them in. The "Discover Artist Address" action re-runs that if the panel is renamed.',
+		},
+		{
+			type: 'textinput',
+			id: 'rrcsHost',
+			label: 'RRCS Host (Artist gateway) - leave blank to disable',
+			width: 8,
+			default: '',
+		},
+		{
+			type: 'number',
+			id: 'rrcsPort',
+			label: 'RRCS Port',
+			width: 4,
+			default: 8193,
+			min: 1,
+			max: 65535,
+		},
+		{
+			type: 'number',
+			id: 'artistNode',
+			label: "This panel's Artist Node address (0 = discover automatically)",
+			width: 6,
+			default: 0,
+			min: 0,
+			max: 999,
+			isVisible: (options) => !!options['rrcsHost'],
+		},
+		{
+			type: 'number',
+			id: 'artistPort',
+			label: "This panel's Artist Port address (0 = discover automatically)",
+			width: 6,
+			default: 0,
+			min: 0,
+			max: 9999,
+			isVisible: (options) => !!options['rrcsHost'],
 		},
 		// Ganged volume trim. Also opt-in: with it off the module never sends a rotary
 		// step of its own, so an upgraded connection behaves exactly as before.
