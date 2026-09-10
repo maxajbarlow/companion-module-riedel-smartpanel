@@ -60,6 +60,10 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 	private interfaceLinkStatuses: Map<string, string> = new Map()
 	private networkSettings: NetworkSettings | null = null
 	public identifyEnabled = false
+	// Cancellation generations for in-flight identify flash sequences, keyed by
+	// target ('local' for the primary connection, host IP for remote panels).
+	// Bumping a key's generation cancels any flash loop running against it.
+	private identifyFlashGens: Map<string, number> = new Map()
 	public artistConnectionStatus = 'Unknown'
 	public healthStatus = 'Unknown'
 	private alarmList: unknown[] = []
@@ -165,6 +169,7 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 	}
 
 	async destroy(): Promise<void> {
+		this.cancelAllIdentifyFlashes()
 		this.stopPingTimer()
 		if (this.reconnectTimer) {
 			clearTimeout(this.reconnectTimer)
@@ -178,6 +183,7 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 	}
 
 	async configUpdated(config: DeviceConfig): Promise<void> {
+		this.cancelAllIdentifyFlashes()
 		this.config = config
 		this.stopPingTimer()
 		if (this.ws) {
@@ -1200,15 +1206,35 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 	}
 
 	// Identify methods
-	// Note: the panel has no built-in "flash count" parameter - /Identify only exposes
-	// a bare on/off latch. Empirically, each Enable/Disable message is itself one visible
-	// flash of the panel's key LEDs (it is not "Enable starts blinking, Disable stops it").
-	// flashIdentify() below reproduces a specific flash count by alternating the latch.
+	// /Identify only exposes a bare on/off latch: Enable starts the panel's identify
+	// blinking and it keeps blinking until a Disable arrives. flashIdentify() therefore
+	// sends explicit Enable/Disable pairs (never a toggle chain seeded from cached
+	// state) so the last message on the wire is always a Disable and a flash can never
+	// strand the panel blinking. Every identify action bumps the target's flash
+	// generation, cancelling any in-flight flash loop - so "Disable Identify" doubles
+	// as a stop button for a runaway flash.
+	private bumpIdentifyFlashGen(key: string): number {
+		const gen = (this.identifyFlashGens.get(key) ?? 0) + 1
+		this.identifyFlashGens.set(key, gen)
+		return gen
+	}
+
+	private isIdentifyFlashCurrent(key: string, gen: number): boolean {
+		return this.identifyFlashGens.get(key) === gen
+	}
+
+	private cancelAllIdentifyFlashes(): void {
+		for (const key of this.identifyFlashGens.keys()) {
+			this.bumpIdentifyFlashGen(key)
+		}
+	}
+
 	public fetchIdentifyStatus(): void {
 		this.sendMessage('/Identify/FetchStatus', {})
 	}
 
 	public enableIdentify(): void {
+		this.bumpIdentifyFlashGen('local')
 		this.sendMessage('/Identify/Enable', {})
 		this.identifyEnabled = true
 		this.setVariableValues({ identify_status: 'Active' })
@@ -1216,6 +1242,7 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 	}
 
 	public disableIdentify(): void {
+		this.bumpIdentifyFlashGen('local')
 		this.sendMessage('/Identify/Disable', {})
 		this.identifyEnabled = false
 		this.setVariableValues({ identify_status: 'Inactive' })
@@ -1232,17 +1259,35 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 
 	public async flashIdentify(count: number, intervalMs: number): Promise<void> {
 		if (count < 1) return
-		let state = this.identifyEnabled
-		for (let i = 0; i < count; i++) {
-			state = !state
-			this.sendMessage(state ? '/Identify/Enable' : '/Identify/Disable', {})
-			this.identifyEnabled = state
-			if (i < count - 1) {
+		const gen = this.bumpIdentifyFlashGen('local')
+		let identifyOn = false
+		try {
+			for (let i = 0; i < count; i++) {
+				if (!this.isIdentifyFlashCurrent('local', gen)) return
+				this.sendMessage('/Identify/Enable', {})
+				identifyOn = true
+				this.identifyEnabled = true
 				await new Promise((resolve) => setTimeout(resolve, intervalMs))
+				if (!this.isIdentifyFlashCurrent('local', gen)) return
+				this.sendMessage('/Identify/Disable', {})
+				identifyOn = false
+				this.identifyEnabled = false
+				if (i < count - 1) {
+					await new Promise((resolve) => setTimeout(resolve, intervalMs))
+				}
+			}
+		} finally {
+			// A cancelled flash (gen no longer current) was superseded by another
+			// identify action which already set the state it wants - leave it alone.
+			if (this.isIdentifyFlashCurrent('local', gen)) {
+				if (identifyOn) {
+					this.sendMessage('/Identify/Disable', {})
+					this.identifyEnabled = false
+				}
+				this.setVariableValues({ identify_status: this.identifyEnabled ? 'Active' : 'Inactive' })
+				this.checkFeedbacks('identifyEnabled')
 			}
 		}
-		this.setVariableValues({ identify_status: this.identifyEnabled ? 'Active' : 'Inactive' })
-		this.checkFeedbacks('identifyEnabled')
 	}
 
 	// Identify-by-IP methods
@@ -1284,12 +1329,14 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 	}
 
 	public async enableIdentifyAtIp(host: string): Promise<void> {
+		this.bumpIdentifyFlashGen(host)
 		await this.runIdentifyOnRemote(host, async (send) => {
 			send('/Identify/Enable')
 		})
 	}
 
 	public async disableIdentifyAtIp(host: string): Promise<void> {
+		this.bumpIdentifyFlashGen(host)
 		await this.runIdentifyOnRemote(host, async (send) => {
 			send('/Identify/Disable')
 		})
@@ -1297,13 +1344,25 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 
 	public async flashIdentifyAtIp(host: string, count: number, intervalMs: number): Promise<void> {
 		if (count < 1) return
+		const gen = this.bumpIdentifyFlashGen(host)
 		await this.runIdentifyOnRemote(host, async (send) => {
-			let state = false
-			for (let i = 0; i < count; i++) {
-				state = !state
-				send(state ? '/Identify/Enable' : '/Identify/Disable')
-				if (i < count - 1) {
+			let identifyOn = false
+			try {
+				for (let i = 0; i < count; i++) {
+					if (!this.isIdentifyFlashCurrent(host, gen)) return
+					send('/Identify/Enable')
+					identifyOn = true
 					await new Promise((resolve) => setTimeout(resolve, intervalMs))
+					if (!this.isIdentifyFlashCurrent(host, gen)) return
+					send('/Identify/Disable')
+					identifyOn = false
+					if (i < count - 1) {
+						await new Promise((resolve) => setTimeout(resolve, intervalMs))
+					}
+				}
+			} finally {
+				if (identifyOn && this.isIdentifyFlashCurrent(host, gen)) {
+					send('/Identify/Disable')
 				}
 			}
 		})

@@ -348,7 +348,7 @@ export function getActions(instance: RiedelRSP1232HLInstance): CompanionActionDe
 		},
 		disableIdentify: {
 			name: 'Disable Identify',
-			description: 'Turn off the panel identify LEDs',
+			description: 'Turn off the panel identify LEDs (also stops an in-progress flash)',
 			options: [],
 			callback: async () => {
 				instance.disableIdentify()
@@ -364,7 +364,7 @@ export function getActions(instance: RiedelRSP1232HLInstance): CompanionActionDe
 		},
 		flashIdentify: {
 			name: 'Flash Identify',
-			description: 'Flash the panel identify LEDs a specific number of times',
+			description: 'Flash the panel identify LEDs a specific number of times (always ends with identify off)',
 			options: [
 				{
 					type: 'number',
@@ -376,7 +376,7 @@ export function getActions(instance: RiedelRSP1232HLInstance): CompanionActionDe
 				},
 				{
 					type: 'number',
-					label: 'Interval Between Flashes (ms)',
+					label: 'Flash On/Off Time (ms)',
 					id: 'intervalMs',
 					default: 400,
 					min: 50,
@@ -416,7 +416,7 @@ export function getActions(instance: RiedelRSP1232HLInstance): CompanionActionDe
 		disableIdentifyAtIp: {
 			name: 'Disable Identify (Custom IP)',
 			description:
-				'Turn off identify LEDs on a panel at a specific IP - supports variables, no dedicated connection needed',
+				'Turn off identify LEDs on a panel at a specific IP (also stops an in-progress flash) - supports variables, no dedicated connection needed',
 			options: [
 				{
 					type: 'textinput',
@@ -438,7 +438,7 @@ export function getActions(instance: RiedelRSP1232HLInstance): CompanionActionDe
 		flashIdentifyAtIp: {
 			name: 'Flash Identify (Custom IP)',
 			description:
-				'Flash identify LEDs a specific number of times on a panel at a specific IP - supports variables, no dedicated connection needed',
+				'Flash identify LEDs a specific number of times on a panel at a specific IP (always ends with identify off) - supports variables, no dedicated connection needed',
 			options: [
 				{
 					type: 'textinput',
@@ -457,7 +457,7 @@ export function getActions(instance: RiedelRSP1232HLInstance): CompanionActionDe
 				},
 				{
 					type: 'number',
-					label: 'Interval Between Flashes (ms)',
+					label: 'Flash On/Off Time (ms)',
 					id: 'intervalMs',
 					default: 400,
 					min: 50,
