@@ -100,7 +100,12 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 	// so an expansion panel's keys are recoverable too, keyed `${panelId}:${keyId}`.
 	private mutedKeys: Map<string, boolean> = new Map() // `${panelId}:${keyId}` -> muted
 	private static readonly MUTE_GRID_COLS = 8
-	private static readonly MUTE_GRID_ROWS = 2
+	// Key cells are a fixed physical size, but the number of ROWS per keybank display
+	// depends on the panel type: the 32-key master (RSP-1232HL) draws 8x2 cells per
+	// display (1284x248), while a 16-key expansion panel (ESP-1216HL) draws 8x1
+	// (1284x130). Rows are therefore derived from the frame height - hardcoding 2
+	// puts every expansion key on display 1 out by +8 (key 9 decoded as key 17).
+	private static readonly KEY_CELL_HEIGHT = 130
 	private static readonly MUTE_RED_THRESHOLD = 0.02
 
 	// --- Per-key volume, decoded from the same rendered key displays ---
@@ -450,9 +455,11 @@ export class RiedelRSP1232HLInstance extends InstanceBase<DeviceConfig> {
 			return
 		}
 		const cols = RiedelRSP1232HLInstance.MUTE_GRID_COLS
-		const rows = RiedelRSP1232HLInstance.MUTE_GRID_ROWS
+		const rows = Math.max(1, Math.round(img.height / RiedelRSP1232HLInstance.KEY_CELL_HEIGHT))
 		const cw = img.width / cols
 		const ch = img.height / rows
+		// Keys per display follows the grid, so display 1 starts at key 17 on the
+		// master (8x2) but at key 9 on an expansion panel (8x1).
 		const baseKey = displayId * cols * rows
 		let changed = false
 		let volumeChanged = false
